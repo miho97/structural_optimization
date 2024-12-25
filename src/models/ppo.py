@@ -43,116 +43,151 @@ class RolloutBuffer:
     def clear(self):
         self.ptr = 0
         
-class ActorCritic(nn.Module):
-    def __init__(self, state_dim, action_dim, has_continuous_action_space, action_std_init, dropout_rate=0.3):
-        super(ActorCritic, self).__init__()
 
+class ActorCritic(nn.Module):
+    def __init__(
+        self, 
+        state_dim, 
+        action_dim, 
+        has_continuous_action_space, 
+        action_std_init, 
+        width, 
+        height, 
+        dropout_rate=0.3
+    ):
+        super(ActorCritic, self).__init__()
+        
         self.has_continuous_action_space = has_continuous_action_space
+        self.width = width
+        self.height = height
 
         if has_continuous_action_space:
             self.action_dim = action_dim
-            self.action_var = torch.full((action_dim,), action_std_init ** 2).to(device)
+            self.action_var = torch.full((action_dim,), action_std_init ** 2)
+    
+        # CNN Feature Extractor
+        channels = 1  # Adjust if you have multiple features per grid cell
+        self.conv = nn.Sequential(
+            nn.Conv2d(channels, 32, kernel_size=3, stride=1, padding=1),  # Output: 32 x H x W
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),  # Output: 32 x H/2 x W/2
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),  # Output: 64 x H/2 x W/2
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),  # Output: 64 x H/4 x W/4
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),  # Output: 128 x H/4 x W/4
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1))  # Output: 128 x 1 x 1
+        )
+        
+        # Manually set n_flatten based on CNN architecture
+        n_flatten = 128
 
         # Actor Network
         if has_continuous_action_space:
             self.actor = nn.Sequential(
-                nn.Linear(state_dim, 64),
-                nn.LayerNorm(64),
-                nn.Tanh(),
+                nn.Linear(n_flatten, 256),
+                nn.ReLU(),
                 nn.Dropout(dropout_rate),
-                nn.Linear(64, 64),
-                nn.LayerNorm(64),
-                nn.Tanh(),
+                nn.Linear(256, 256),
+                nn.ReLU(),
                 nn.Dropout(dropout_rate),
-                nn.Linear(64, action_dim),
+                nn.Linear(256, action_dim),
                 nn.Tanh()
             )
         else:
             self.actor = nn.Sequential(
-                nn.Linear(state_dim, 128),
-                nn.LayerNorm(128),
-                nn.Tanh(),
+                nn.Linear(n_flatten, 256),
+                nn.ReLU(),
                 nn.Dropout(dropout_rate),
-                nn.Linear(128, 128),
-                nn.LayerNorm(128),
-                nn.Tanh(),
+                nn.Linear(256, 256),
+                nn.ReLU(),
                 nn.Dropout(dropout_rate),
-                nn.Linear(128, action_dim),
+                nn.Linear(256, action_dim),
                 nn.Softmax(dim=-1)
             )
 
         # Critic Network
         self.critic = nn.Sequential(
-            nn.Linear(state_dim, 128),
-            nn.LayerNorm(128),
-            nn.Tanh(),
+            nn.Linear(n_flatten, 256),
+            nn.ReLU(),
             nn.Dropout(dropout_rate),
-            nn.Linear(128, 128),
-            nn.LayerNorm(128),
-            nn.Tanh(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
             nn.Dropout(dropout_rate),
-            nn.Linear(128, 1)
+            nn.Linear(256, 1)
         )
 
         # Initialize weights
         self.apply(self.weights_init_)
 
     def weights_init_(self, m):
-        if isinstance(m, nn.Linear):
-            torch.nn.init.kaiming_uniform_(m.weight, a=0, mode='fan_in', nonlinearity='relu')
-            torch.nn.init.constant_(m.bias, 0)
+        if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
+            nn.init.kaiming_uniform_(m.weight, a=0, mode='fan_in', nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
 
-    def set_action_std(self, new_action_std):
+    def forward(self, state):
+        # Assume state is of shape (batch_size, width*height)
+        # Reshape to (batch_size, channels, height, width)
+        state = state.view(-1, 1, self.height, self.width)
+        
+        conv_out = self.conv(state)
+        conv_out = conv_out.view(conv_out.size(0), -1)  
+
+        action_logits = self.actor(conv_out)
+
+        state_values = self.critic(conv_out)
+
         if self.has_continuous_action_space:
-            self.action_var = torch.full((self.action_dim,), new_action_std * new_action_std).to(device)
+            action_mean = action_logits
+            return action_mean, state_values
         else:
-            print("--------------------------------------------------------------------------------------------")
-            print("WARNING : Calling ActorCritic::set_action_std() on discrete action space policy")
-            print("--------------------------------------------------------------------------------------------")
+            action_probs = action_logits
+            return action_probs, state_values
 
-    def forward(self):
-        raise NotImplementedError
 
-    def act(self, states):
+    def act(self, state):
+        action_mean, state_value = self.forward(state)
+        
         if self.has_continuous_action_space:
-            action_mean = self.actor(states)
             action_var = self.action_var.expand_as(action_mean)
-            cov_mat = torch.diag_embed(action_var).to(device)
+            cov_mat = torch.diag_embed(action_var).to(self.device)
             dist = MultivariateNormal(action_mean, cov_mat)
             actions = dist.sample()
             action_logprobs = dist.log_prob(actions)
         else:
-            action_probs = self.actor(states)
+            action_probs = action_mean
             dist = Categorical(action_probs)
             actions = dist.sample()
             action_logprobs = dist.log_prob(actions)
         
-        state_values = self.critic(states).squeeze(-1)  
+        state_values = state_value.squeeze(-1)
         return actions, action_logprobs, state_values
 
 
 
+
     def evaluate(self, states, actions):
+        action_mean, state_values = self.forward(states)
+        
         if self.has_continuous_action_space:
-            action_mean = self.actor(states)
             action_var = self.action_var.expand_as(action_mean)
-            cov_mat = torch.diag_embed(action_var).to(device)
+            cov_mat = torch.diag_embed(action_var).to(self.device)
             dist = MultivariateNormal(action_mean, cov_mat)
         else:
-            action_probs = self.actor(states)
+            action_probs = action_mean
             dist = Categorical(action_probs)
-
+        
         action_logprobs = dist.log_prob(actions)
         dist_entropy = dist.entropy()
-        state_values = self.critic(states)
-
         return action_logprobs, state_values, dist_entropy
+
 
 
 class PPO:
     def __init__(self, state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, has_continuous_action_space,
                  action_std_init=0.6, gae_lambda=0.95, num_envs=1, device = device):
-        
+
         self.has_continuous_action_space = has_continuous_action_space
         self.num_envs = num_envs
 
@@ -160,7 +195,7 @@ class PPO:
             self.action_std = action_std_init
 
         self.gamma = gamma
-        self.gae_lambda = gae_lambda  
+        self.gae_lambda = gae_lambda 
         self.eps_clip = eps_clip
         self.K_epochs = K_epochs
         self.state_dim = state_dim
@@ -174,7 +209,7 @@ class PPO:
         self.device = device
         self.buffer = RolloutBuffer(max_size=10000, state_dim=state_dim, num_envs=num_envs)
 
-        self.policy = ActorCritic(state_dim, action_dim, has_continuous_action_space, action_std_init).to(device)
+        self.policy = ActorCritic(state_dim, action_dim, has_continuous_action_space, action_std_init,  width = state_dim//6, height = state_dim//6).to(device)
         self.optimizer = torch.optim.Adam([
                         {'params': self.policy.actor.parameters(), 'lr': lr_actor},
                         {'params': self.policy.critic.parameters(), 'lr': lr_critic}
@@ -182,7 +217,7 @@ class PPO:
 
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=1000, gamma=0.95)
 
-        self.policy_old = ActorCritic(state_dim, action_dim, has_continuous_action_space, action_std_init).to(device)
+        self.policy_old = ActorCritic(state_dim, action_dim, has_continuous_action_space, action_std_init, width = state_dim//6, height = state_dim//6).to(device)
         self.policy_old.load_state_dict(self.policy.state_dict())
         
         self.MseLoss = nn.MSELoss()
@@ -312,7 +347,8 @@ class PPO:
 
             loss_entropy = -dist_entropy.mean()
 
-            loss = 2 * loss_actor +  loss_critic + 0.05 * loss_entropy
+            # loss = 2 * loss_actor +  loss_critic + 0.05 * loss_entropy
+            loss = 2 * loss_actor +  loss_critic - 0.05 * loss_entropy
 
             self.optimizer.zero_grad()
             loss.backward()
