@@ -285,20 +285,16 @@ class PPO:
         actions = self.buffer.actions[:self.buffer.ptr].cpu().numpy()  # Shape: (ptr, num_envs)
         logprobs = self.buffer.logprobs[:self.buffer.ptr].cpu().numpy()  
  
-        # Step 2: Compute GAE
         returns, advantages = self.compute_gae(rewards, state_values, is_terminals, self.gamma, self.gae_lambda)
 
-        # Step 3: Flatten the tensors to shape [max_size * num_envs, ...] for training
         states = self.buffer.states[:self.buffer.ptr].reshape(-1, self.buffer.states.size(-1)).to(self.device)  # [max_size*num_envs, state_dim]
         actions = self.buffer.actions[:self.buffer.ptr].reshape(-1).to(self.device)  # [max_size*num_envs]
         logprobs = self.buffer.logprobs[:self.buffer.ptr].reshape(-1).to(self.device)  # [max_size*num_envs]
         returns = returns.reshape(-1)  # [max_size*num_envs]
         advantages = advantages.reshape(-1)  # [max_size*num_envs]
 
-        # Step 4: Normalize advantages for better training stability
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        # Step 5: Optimize policy for K epochs
         for epoch in range(self.K_epochs):
             logprobs_new, state_values_new, dist_entropy = self.policy.evaluate(states, actions)
             state_values_new = state_values_new.view(-1)
@@ -349,7 +345,7 @@ class PPO:
         }, checkpoint_path)
 
     def load(self, checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
         self.policy_old.load_state_dict(checkpoint['policy_state_dict'])
         self.policy.load_state_dict(checkpoint['policy_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
