@@ -19,7 +19,8 @@ class BeamOptimizationEnv(gym.Env):
         self.max_steps = self.width * self.height * 10
         self.action_space = gym.spaces.Discrete(2 * self.width * self.height)  
         self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=(self.width * self.height,), dtype=np.float32)
-        self.reset()
+        self.beam_type = beam_type
+        # self.reset()
 
         beam_functions = {
             1: fem.mbb_beam_1,
@@ -29,15 +30,20 @@ class BeamOptimizationEnv(gym.Env):
         }
         
         # normals, forces, _ = fem.mbb_beam(width, height, density)
-        normals, forces, _ = beam_functions[beam_type](width, height, density)
+        if self.beam_type > 0:
+            normals, forces, _ = beam_functions[beam_type](width, height, density)
+        else:
+            normals, forces, _ = beam_functions[1](width, height, density)
+
         self.normals = torch.tensor(normals, dtype=torch.float32, device=self.device)
         self.forces = torch.tensor(forces, dtype=torch.float32, device=self.device)
         self.args = fem.get_args(self.normals.cpu().numpy(), self.forces.cpu().numpy(), density)
-        
         self.current_compliance = float('inf')
         self.previous_compliance = float('inf')
         self.current_constraint = 0.5 
         self.reward = 0
+
+        self.reset()
 
         if reward_weights == None:
             self.w_compliance = 1.0
@@ -65,21 +71,73 @@ class BeamOptimizationEnv(gym.Env):
         self.previous_compliance = float('inf')
         self.current_constraint = 1.0
         self.reward = 0
-        return self.state.cpu().numpy(),{}
 
+        if self.beam_type == 0:
+            self.forces = self.randomize_forces()
+            #self.normals = self.randomize_supports()
+            #self.normals += self.randomize_normals()
+            self.args = fem.get_args(self.normals.cpu().numpy(), self.forces.cpu().numpy(), self.density)
+
+        return self.state.cpu().numpy(),{}
+    
+    def randomize_supports(self):
+ 
+        supports = np.zeros((self.width + 1, self.height + 1, 2), dtype=np.float32)
+        
+
+        supports[-1, -1, 1] = 1
+        supports[0, self.height, 0] = 1
+
+        return torch.tensor(supports, dtype=torch.float32, device=self.device)
+
+    def randomize_forces(self):
+
+        num_forces = np.random.choice([1, 2, 3])
+        forces = np.zeros((self.width + 1, self.height + 1, 2), dtype=np.float32)  
+        total_positions = (self.width + 1) * (self.height + 1)
+        
+        selected_indices = np.random.choice(total_positions, size=num_forces, replace=False)
+        
+        for idx in selected_indices:
+            x, y = divmod(idx, self.height + 1)
+            axis = np.random.choice(['x', 'y'])
+            direction = np.random.choice([1, -1])
+            if axis == 'x':
+                forces[x, y, 0] = direction * 1.0  
+            else:
+                forces[x, y, 1] = direction * 1.0  
+        
+        return torch.tensor(forces, dtype=torch.float32, device=self.device)
+    
+    def randomize_normals(self):
+
+        num_normals = np.random.randint(2, 11)  
+        total_positions = (self.width + 1) * (self.height + 1)
+        num_normals = min(num_normals, total_positions)
+        selected_indices = np.random.choice(total_positions, size=num_normals, replace=False)
+        normals = np.zeros((self.width + 1, self.height + 1, 2), dtype=np.float32)
+        
+        for idx in selected_indices:
+            x, y = divmod(idx, self.height + 1)
+            axis = np.random.choice(['x', 'y'])
+            direction = np.random.choice([1, -1])
+            if axis == 'x':
+                normals[x, y, 0] = direction * 1.0
+            else:
+                normals[x, y, 1] = direction * 1.0
+            forces_np = self.forces.cpu().numpy()
+        for x in range(self.width + 1):
+            for y in range(self.height + 1):
+                if np.any(forces_np[x, y] != 0):
+                    normals[x, y] = 0
+        return torch.tensor(normals, dtype=torch.float32, device=self.device)
 
 
     def calculate_total_density(self):
-        """
-        Calculate the mean density of the current state.
-        """
         return np.mean(self.state.cpu().numpy())
+
     def is_connected(self, state, threshold=0.8):
-        """
-        Check if the structure is fully connected using NetworkX.
-        """
         grid = state.cpu().numpy().reshape(self.height, self.width)
-        # Create a graph where nodes are occupied cells
         G = nx.Graph()
         for i in range(self.height):
             for j in range(self.width):
