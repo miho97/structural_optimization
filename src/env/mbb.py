@@ -109,6 +109,21 @@ class BeamOptimizationEnv(gym.Env):
         
         return torch.tensor(forces, dtype=torch.float32, device=self.device)
     
+    def randomize_forces(self):
+
+        num_forces = np.random.choice([1,2,3])
+        forces = np.zeros((self.width + 1, self.height + 1, 2), dtype=np.float32)  
+        selected_indices = np.random.choice([0,1,2,3,4], size=num_forces, replace=False)
+        
+        for idx in selected_indices:
+            axis = np.random.choice(['x','y'])
+            direction = np.random.choice([1, -1])
+            if axis == 'x':
+                forces[0, idx, 0] = direction * 1.0  
+            else:
+                forces[0, idx, 1] = direction * 1.0
+        return torch.tensor(forces, dtype=torch.float32, device=self.device)
+
     def randomize_normals(self):
 
         num_normals = np.random.randint(2, 11)  
