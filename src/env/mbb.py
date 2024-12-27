@@ -8,7 +8,7 @@ import logging
 
 class BeamOptimizationEnv(gym.Env):
     metadata = {'render.modes': ['human']}  
-    def __init__(self, width=4, height=4, density=0.4, step_size=0.05, optimal_density=0.5, reward_weights = None, beam_type=1 ):
+    def __init__(self, width=4, height=4, density=0.4, step_size=0.05, optimal_density=0.6, reward_weights = None, beam_type=1 ):
         super(BeamOptimizationEnv, self).__init__()
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.width = width
@@ -213,10 +213,10 @@ class BeamOptimizationEnv(gym.Env):
 
         densities = self.state.cpu().numpy()
 
-        density_high_reward = np.mean( (densities - 0.5) ** 2)  
+        density_high_reward = 2 * np.mean( (0.5 - densities) ** 2)  
         reward_density_high = w_density_high * density_high_reward
 
-        density_low_reward = np.mean((0.5 - densities) ** 2)  
+        density_low_reward = 2 * np.mean((0.5 - densities) ** 2)  
         reward_density_low = w_density_low * density_low_reward
 
         target_total_density = self.optimal_density * self.width * self.height
@@ -229,7 +229,7 @@ class BeamOptimizationEnv(gym.Env):
                                 (1 - densities) * np.log(1 - densities + 1e-8))
         reward_entropy = w_entropy * density_entropy
 
-        reward = (reward_compliance + #reward_connectivity + reward_isolated +
+        reward = (reward_compliance +
                 reward_density_high + reward_density_low + reward_total_mass +
                 reward_entropy)
         
