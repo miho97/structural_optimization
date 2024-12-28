@@ -5,10 +5,11 @@ import matplotlib.pyplot as plt
 import networkx as nx  
 from utils import fem
 import logging
+import random
 
 class BeamOptimizationEnv(gym.Env):
     metadata = {'render.modes': ['human']}  
-    def __init__(self, width=4, height=4, density=0.4, step_size=0.05, optimal_density=0.5, reward_weights = None, beam_type=1 ):
+    def __init__(self, width=4, height=4, density=0.4, step_size=0.05, optimal_density=0.5, reward_weights = None, beam_type=1, max_forces = 2 ):
         super(BeamOptimizationEnv, self).__init__()
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.width = width
@@ -17,9 +18,14 @@ class BeamOptimizationEnv(gym.Env):
         self.step_size = step_size  
         self.optimal_density = optimal_density  
         self.max_steps = self.width * self.height * 10
+        self.max_forces = max_forces
+        
         self.action_space = gym.spaces.Discrete(2 * self.width * self.height)  
-        self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=(self.width * self.height,), dtype=np.float32)
-        self.reset()
+        state_dim = self.width * self.height + (self.width + 1) * ( self.height + 1) * 2
+        self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=(state_dim,), dtype=np.float32)
+
+        # self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=(self.width * self.height,), dtype=np.float32)
+        #self.reset()
 
         beam_functions = {
             1: fem.mbb_beam_1,
@@ -39,6 +45,7 @@ class BeamOptimizationEnv(gym.Env):
         self.current_constraint = 0.5 
         self.reward = 0
 
+        self.reset()
         if reward_weights == None:
             self.w_compliance = 1.0
             self.w_density_high = 1.0   
@@ -59,16 +66,45 @@ class BeamOptimizationEnv(gym.Env):
         
         self.state = torch.ones((self.width * self.height), dtype=torch.float32, device=self.device)* 0.5
         self.current_step = 0
-        self.visited = torch.zeros((self.width * self.height), dtype=bool, device=self.device)
-        self.visited_cells = set()
-        self.current_compliance = float('inf')
-        self.previous_compliance = float('inf')
-        self.current_constraint = 1.0
         self.reward = 0
+        self.args = fem.get_args(self.normals.cpu().numpy(), self.forces.cpu().numpy(), self.density)
+        self.state = self.construct_state()
         return self.state.cpu().numpy(),{}
 
+    def randomize_forces(self):
+        num_forces = random.randint(1, self.max_forces)
+        forces = []
+        for _ in range(num_forces):
+            x_pos = random.uniform(0, 1)  
+            y_pos = 1.0  
+            magnitude = random.uniform(0.5, 1.5)  
+            direction = random.uniform(-np.pi/4, np.pi/4)  
+            forces.append((x_pos, y_pos, magnitude, direction))
+        
+        while len(forces) < self.max_forces:
+            forces.append((0.0, 0.0, 0.0, 0.0))
+        
+        return np.array(forces, dtype=np.float32)
+    
+    def construct_state(self):
 
+        density_flat = self.state.clone().detach()
+        density_flat = density_flat.flatten()
+        
+        forces_normalized = self.forces.clone().detach()
 
+        forces_normalized[:, 2] = (forces_normalized[:, 2] - 0.5) / 1.0  
+        forces_normalized[:, 3] = (forces_normalized[:, 3] + np.pi/4) / (np.pi/2)  
+        
+        forces_flat = forces_normalized.flatten()
+        
+        state = torch.cat([density_flat, forces_flat], dim=0)
+        # print(f"Constructed state shape: {state.shape}")
+        # print(f"Density flat shape is {density_flat.shape}")
+        # p#rint(f"forces flat shape is {forces_flat.shape}")
+        return state
+
+    
     def calculate_total_density(self):
         """
         Calculate the mean density of the current state.
@@ -197,7 +233,8 @@ class BeamOptimizationEnv(gym.Env):
     def calculate_reward(self):
 
         with torch.no_grad():
-            compliance, constraint = fem.optim(args=self.args, x=self.state.cpu().numpy())
+            x = self.state[:self.width * self.height]
+            compliance, constraint = fem.optim(args=self.args, x=x.cpu().numpy())
         #if compliance > 500:
         #    return -1
         current_density = self.calculate_total_density()

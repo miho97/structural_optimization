@@ -1,19 +1,19 @@
-# pinn_topology_optimization.py
 
 import torch
 import torch.nn as nn
 
 class DensityPINN(nn.Module):
-    def __init__(self, width, height, hidden_dim=64):
+    def __init__(self, width, height, hidden_dim=64, config_dim=4):
 
         super(DensityPINN, self).__init__()
         self.width = width
         self.height = height
         self.num_elements = width * height
         self.hidden_dim = hidden_dim
+        self.config_dim = config_dim
 
         self.net = nn.Sequential(
-            nn.Linear(2, hidden_dim),
+            nn.Linear(2 + config_dim, hidden_dim),
             nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.Tanh(),
@@ -21,7 +21,8 @@ class DensityPINN(nn.Module):
             nn.Sigmoid()  
         )
 
-    def forward(self, coords):
+    def forward(self, coords, config):
 
-        density = self.net(coords).squeeze(-1)
+        input_tensor = torch.cat([coords, config], dim=1)  # Shape: (num_elements, 2 + config_dim)
+        density = self.net(input_tensor).squeeze(-1)
         return density

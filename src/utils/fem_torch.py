@@ -3,6 +3,7 @@
 import torch
 import numpy as np
 import time
+import random
 
 device = torch.device('cpu')
 if(torch.cuda.is_available()): 
@@ -26,6 +27,23 @@ def mbb_beam_4(width=6, height=6, density=0.4, y=1, x=0):
     forces = torch.zeros((width + 1, height + 1, 2), dtype=torch.float32, device= device)
     forces[width, 0, y] = -1
     return normals, forces, density
+
+def mbb_beam_random(width=10, height=10, density=0.4):
+
+    normals = torch.zeros((width + 1, height + 1, 2), dtype=torch.float32)
+    forces = torch.zeros((width + 1, height + 1, 2), dtype=torch.float32)
+
+    num_supports = random.randint(1, width // 2)
+    support_indices = random.sample(range(width + 1), num_supports)
+    for idx in support_indices:
+        normals[idx, 0, 0] = 1
+        normals[idx, 0, 1] = 1 
+
+    force_idx = random.randint(0, height)
+    forces[width, force_idx, 1] = -random.uniform(0.5, 1.5) 
+
+    return normals, forces, density
+
 
 def get_args(normals, forces, density=0.4):
     """

@@ -140,6 +140,8 @@ class ActorCritic(nn.Module):
             dist = MultivariateNormal(action_mean, cov_mat)
         else:
             action_probs = self.actor(states)
+            print(f"shape of action probs is {action_probs.shape}")
+            print(action_probs)
             dist = Categorical(action_probs)
 
         action_logprobs = dist.log_prob(actions)
@@ -147,7 +149,14 @@ class ActorCritic(nn.Module):
         state_values = self.critic(states)
 
         return action_logprobs, state_values, dist_entropy
-
+    
+    def evaluate(self, states, actions):
+        logits = self.actor(states)  # Get logits instead of probabilities
+        dist = Categorical(logits=logits)  # Use logits directly for numerical stability
+        action_logprobs = dist.log_prob(actions)
+        dist_entropy = dist.entropy()
+        state_values = self.critic(states)
+        return action_logprobs, state_values, dist_entropy
 
 class PPO:
     def __init__(self, state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, has_continuous_action_space,
@@ -298,7 +307,7 @@ class PPO:
         for epoch in range(self.K_epochs):
             logprobs_new, state_values_new, dist_entropy = self.policy.evaluate(states, actions)
             state_values_new = state_values_new.view(-1)
-
+            print(f"state values new shape is {state_values_new.shape}")
 
             ratios = torch.exp(logprobs_new - logprobs)
 
