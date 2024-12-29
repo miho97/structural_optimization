@@ -55,8 +55,15 @@ def get_args(normals, forces, density=0.4):
     """
     Extract parameters from normals and forces.
     """
+    device = torch.device('cpu')
+    if(torch.cuda.is_available()): 
+        device = torch.device('cuda:0') 
+        torch.cuda.empty_cache()
+
     width = normals.shape[0] - 1
     height = normals.shape[1] - 1
+
+    # fixdofs = torch.nonzero(normals.view(-1) > 0, as_tuple=False).squeeze(-1)
     fixdofs = torch.nonzero(normals.view(-1) > 0, as_tuple=False).squeeze(-1)
     alldofs = torch.arange(2 * (width + 1) * (height + 1), device= device)
     freedofs = torch.tensor(list(set(alldofs.cpu().numpy()) - set(fixdofs.cpu().numpy())), dtype=torch.long, device= device)

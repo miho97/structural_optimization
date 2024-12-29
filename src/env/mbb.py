@@ -1,16 +1,18 @@
 import gymnasium as gym
 import torch
+import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
 import networkx as nx  
-from utils import fem
+from utils import fem_torch
 import logging
+from models import pinn
 
 class BeamOptimizationEnv(gym.Env):
     metadata = {'render.modes': ['human']}  
-    def __init__(self, width=4, height=4, density=0.4, step_size=0.05, optimal_density=0.5, reward_weights = None, beam_type=1 ):
+    def __init__(self, width=4, height=4, density=0.4, step_size=0.05, optimal_density=0.5, reward_weights = None, beam_type=1, inference = False ):
         super(BeamOptimizationEnv, self).__init__()
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
         self.width = width
         self.height = height
         self.density = density
@@ -21,22 +23,39 @@ class BeamOptimizationEnv(gym.Env):
         self.state_dim = self.width*self.height  + (self.width + 1)*(self.height + 1) * 2
         self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=(self.state_dim, ), dtype=np.float32)
         # self.reset()
+        self.inference = inference
 
         beam_functions = {
-            1: fem.mbb_beam_1,
-            2: fem.mbb_beam_2,
-            3: fem.mbb_beam_3,
-            4: fem.mbb_beam_4,
-            5: fem.mbb_beam_5
+            1: fem_torch.mbb_beam_1,
+            2: fem_torch.mbb_beam_2,
+            3: fem_torch.mbb_beam_3,
+            4: fem_torch.mbb_beam_4,
+            5: fem_torch.mbb_beam_5
 
         }
-        
+        # print("we are in mbb.py constructor of the class")
         # normals, forces, _ = fem.mbb_beam(width, height, density)
         normals, forces, _ = beam_functions[beam_type](width, height, density)
-        self.normals = torch.tensor(normals, dtype=torch.float32, device=self.device)
-        self.forces = torch.tensor(forces, dtype=torch.float32, device=self.device)
-        self.args = fem.get_args(self.normals.cpu().numpy(), self.forces.cpu().numpy(), density)
+        self.normals = normals.clone().detach().to(self.device)#torch.tensor(normals, dtype=torch.float32, device=self.device)
+        self.forces = forces.clone().detach().to(self.device) #torch.tensor(forces, dtype=torch.float32, device=self.device)
+        # print( type(self.normals))
         
+        # print(f"self.forces in mbb.py is of shpae {self.forces.shape}")
+        # print(f"type of slef.forces {type(self.forces)} {type(self.normals)}")
+        self.args = fem_torch.get_args(self.normals, self.forces, density)
+
+        input_dim_coords = self.width * self.height
+        input_dim_config = (self.width + 1) * (self.height + 1) * 2
+        output_dim = self.width * self.height
+
+        self.pinn_model = pinn.PINN(
+            input_dim_coords=input_dim_coords,
+            input_dim_config=input_dim_config,
+            output_dim=output_dim,
+            hidden_dims=[128, 128, 128]
+        )
+        self.pinn_optimizer = optim.Adam(self.pinn_model.parameters(), lr=1e-3)
+
         self.current_compliance = float('inf')
         self.previous_compliance = float('inf')
         self.current_constraint = 0.5 
@@ -87,6 +106,7 @@ class BeamOptimizationEnv(gym.Env):
         self.state = self.construct_state(temp_state, self.forces)
 
         # print(f"shape of constructed space is {self.state.shape}")
+        # print(f"type of the fuckin state is {type(self.state)}")
 
         return self.state.cpu().numpy(),{}
 
@@ -145,6 +165,7 @@ class BeamOptimizationEnv(gym.Env):
         """
         Perform the action and return the new state, reward, done, truncated, and info.
         """
+        # print(f"nigga we eneterd step")
         # Map action to cell and direction
         total_cells = self.width * self.height
         if action < 0 or action >= 2 * total_cells:
@@ -180,8 +201,9 @@ class BeamOptimizationEnv(gym.Env):
                 reward += 0.05  
 
         self.current_step += 1
-
+        # print(f"we are in step before reward calculation")
         # Calculate additional reward components
+        # if not self.inference:
         additional_reward, reward_info = self.calculate_reward()
         reward += additional_reward
         reward = reward / (abs(reward) + 1)
@@ -210,18 +232,55 @@ class BeamOptimizationEnv(gym.Env):
                 f"Compliance: {reward_info['compliance']:.2f} | "
                 f"Constraint: {reward_info['constraint']:.2f}"
             )
-        # print(f"state shaoe before returning it from step function is {self.state.shape}")
+        # print(f"WE ARE DONE WITH STEP------------------------------------------------------")
         return self.state.cpu().numpy(), reward, done, False, info
   
 
     def calculate_reward(self):
 
-        with torch.no_grad():
-            x = self.state.cpu().numpy()
-            x = x[: self.width * self.height]
-            compliance, constraint = fem.optim(args=self.args, x=x)
+        k = 10  
 
-        penalty_connectivity = self.check_connectivity(x)
+
+        if self.current_step % k == 0 and not self.inference:
+
+            flattened_density = self.state[: self.width * self.height].unsqueeze(0)  
+            flattened_forces = self.forces.view(1, -1)          
+            
+
+            flattened_density = flattened_density.clone().detach().to(self.device)
+            flattened_forces = flattened_forces.to(self.device)
+            # print(f"flattended densit  {flattened_density.device}")
+            # print(f"flattended force dev {flattened_forces.device}")
+            # print("RIGHT BEFORE TRIANING PINN")
+            # Train the PINN on the current state
+            refined_design = pinn.train_pinn(
+                pinn_model=self.pinn_model,
+                initial_design=flattened_density,
+                forces=flattened_forces,
+                device = self.device,
+                opt= self.pinn_optimizer,
+                epochs=3,    # Number of training epochs. Adjust as needed.
+                lr=1e-3,     # Learning rate for PINN training. Adjust as needed.
+            )
+            
+            # Update the density grid with the refined design
+            temp = self.construct_state(refined_design.squeeze(0), self.forces ) 
+            
+            # Compute compliance using the refined design
+            compliance_pinn, constraint = fem_torch.compliance_and_constraint(args=self.args, x=temp[: self.width * self.height])
+            
+            # Use compliance_pinn as part of the reward
+            compliance = compliance_pinn.item()
+        else:
+            with torch.no_grad():
+                x = self.state
+                x = x[: self.width * self.height]
+                # print(f"we are in REWARD FUNCTION AND TYPE OF X IS {type(x)}")
+                compliance, constraint = fem_torch.compliance_and_constraint(args=self.args, x=x)
+                # print(f"COMPLIANCE IS {compliance} WHILE THE CONSTRAINT IS {constraint}")
+                compliance = compliance.item()
+                constraint = constraint.item()
+
 
         w_compliance = self.w_compliance
         w_density_high = self.w_density_high  
@@ -254,7 +313,7 @@ class BeamOptimizationEnv(gym.Env):
 
         reward = (reward_compliance + #reward_connectivity + reward_isolated +
                 reward_density_high + reward_density_low + reward_total_mass +
-                reward_entropy - penalty_connectivity)
+                reward_entropy )
         
 
         # Large or unbounded rewards can lead to large gradient updates
@@ -278,7 +337,7 @@ class BeamOptimizationEnv(gym.Env):
         self.current_compliance = compliance
         self.current_constraint = constraint
         self.reward = scaled_reward
-
+        # print("we are done with reward----------------------------------------------------------------------")
         return scaled_reward, reward_info
 
 
