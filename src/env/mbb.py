@@ -17,15 +17,18 @@ class BeamOptimizationEnv(gym.Env):
         self.step_size = step_size  
         self.optimal_density = optimal_density  
         self.max_steps = self.width * self.height * 10
-        self.action_space = gym.spaces.Discrete(2 * self.width * self.height)  
-        self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=(self.width * self.height,), dtype=np.float32)
-        self.reset()
+        self.action_space = gym.spaces.Discrete(2 * self.width * self.height)
+        self.state_dim = self.width*self.height  + (self.width + 1)*(self.height + 1) * 2
+        self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=(self.state_dim, ), dtype=np.float32)
+        # self.reset()
 
         beam_functions = {
             1: fem.mbb_beam_1,
             2: fem.mbb_beam_2,
             3: fem.mbb_beam_3,
-            4: fem.mbb_beam_4
+            4: fem.mbb_beam_4,
+            5: fem.mbb_beam_5
+
         }
         
         # normals, forces, _ = fem.mbb_beam(width, height, density)
@@ -38,6 +41,7 @@ class BeamOptimizationEnv(gym.Env):
         self.previous_compliance = float('inf')
         self.current_constraint = 0.5 
         self.reward = 0
+        self.reset()
 
         if reward_weights == None:
             self.w_compliance = 1.0
@@ -52,12 +56,26 @@ class BeamOptimizationEnv(gym.Env):
             self.w_total_mass = reward_weights['w_total_mass']
             self.w_entropy = reward_weights['w_entropy']
 
+    def construct_state(self, state, forces):
+
+        if not isinstance(forces, torch.Tensor):
+            raise TypeError("Forces must be a torch.Tensor")
+        
+        forces_flat = forces.flatten()
+        
+        concatenated_state = torch.cat((state, forces_flat), dim=0)
+        if torch.isnan(concatenated_state).any():
+            print("NaN detected in concatenated state!")
+            concatenated_state = torch.nan_to_num(concatenated_state, nan=0.0)
+        # print(f"shape od concatenadet state is {concatenated_state.shape}")
+        return concatenated_state
+
     def reset(self,*, seed=None, options=None):
         if seed is not None:
             np.random.seed(seed)
             torch.manual_seed(seed)
         
-        self.state = torch.ones((self.width * self.height), dtype=torch.float32, device=self.device)* 0.5
+        temp_state = torch.ones((self.width * self.height), dtype=torch.float32, device=self.device)* 0.5
         self.current_step = 0
         self.visited = torch.zeros((self.width * self.height), dtype=bool, device=self.device)
         self.visited_cells = set()
@@ -65,6 +83,11 @@ class BeamOptimizationEnv(gym.Env):
         self.previous_compliance = float('inf')
         self.current_constraint = 1.0
         self.reward = 0
+
+        self.state = self.construct_state(temp_state, self.forces)
+
+        # print(f"shape of constructed space is {self.state.shape}")
+
         return self.state.cpu().numpy(),{}
 
 
@@ -74,52 +97,49 @@ class BeamOptimizationEnv(gym.Env):
         Calculate the mean density of the current state.
         """
         return np.mean(self.state.cpu().numpy())
-    def is_connected(self, state, threshold=0.8):
-        """
-        Check if the structure is fully connected using NetworkX.
-        """
-        grid = state.cpu().numpy().reshape(self.height, self.width)
-        # Create a graph where nodes are occupied cells
-        G = nx.Graph()
-        for i in range(self.height):
-            for j in range(self.width):
-                if grid[i, j] > threshold:
-                    node = i * self.width + j
-                    G.add_node(node)
-                    # Add edges to neighboring occupied cells (4-connectivity)
-                    for di, dj in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                        ni, nj = i + di, j + dj
-                        if 0 <= ni < self.height and 0 <= nj < self.width and grid[ni, nj] > threshold:
-                            neighbor = ni * self.width + nj
-                            G.add_edge(node, neighbor)
-        # Check if all occupied cells form a single connected component
-        return nx.is_connected(G) if len(G) > 0 else False
 
-    def find_isolated_cells(self, state, width, height, high_threshold=0.8, low_threshold=0.2):
-        """
-        Find cells that are isolated, i.e., have high density but no neighbors with sufficient density.
-        """
-        isolated_cells = []
-        state_np = state.reshape((width, height))
-        for i in range(width):
-            for j in range(height):
-                if state_np[i, j] > high_threshold:
-                    # Check if any neighbor has density > low_threshold
-                    has_neighbor = False
-                    for di in [-1, 0, 1]:
-                        for dj in [-1, 0, 1]:
-                            if di == 0 and dj == 0:
-                                continue
-                            ni, nj = i + di, j + dj
-                            if 0 <= ni < width and 0 <= nj < height and state_np[ni, nj] > low_threshold:
-                                has_neighbor = True
-                                break
-                        if has_neighbor:
-                            break
-                    if not has_neighbor:
-                        isolated_cells.append(i * width + j)
-        return isolated_cells
+    def check_connectivity(self, densities):
+  
+        grid = densities.reshape(self.height, self.width)  # shape (H,W)
+        # Threshold to binary
+        binary_mask = (grid > 0.2).astype(np.uint8)
 
+        # run BFS/Union-Find
+        visited = np.zeros_like(binary_mask, dtype=bool)
+        def neighbors(r, c):
+            for nr, nc in [(r-1,c),(r+1,c),(r,c-1),(r,c+1)]:
+                if 0<=nr<self.height and 0<=nc<self.width:
+                    yield nr,nc
+
+        components = []
+        for r in range(self.height):
+            for c in range(self.width):
+                if binary_mask[r,c] == 1 and not visited[r,c]:
+                    # BFS to find connected region
+                    queue = [(r,c)]
+                    visited[r,c] = True
+                    size = 0
+                    while queue:
+                        rr,cc = queue.pop()
+                        size += 1
+                        for (rr2, cc2) in neighbors(rr, cc):
+                            if binary_mask[rr2,cc2] == 1 and not visited[rr2,cc2]:
+                                visited[rr2,cc2] = True
+                                queue.append((rr2,cc2))
+                    components.append(size)
+
+        # Possibly define a penalty if there's more than 1 big component
+        # or if there's a small floating component
+        # For example:
+        if len(components) <= 1:
+            return 0.0  # no penalty
+        else:
+            # penalty based on how many or how big the extra comps are
+            # e.g. sum of the sizes of all but the largest comp
+            largest = max(components)
+            others_sum = sum(components) - largest
+            penalty = 2 * others_sum  # scale as you want
+            return penalty
 
     def step(self, action):
         """
@@ -190,17 +210,18 @@ class BeamOptimizationEnv(gym.Env):
                 f"Compliance: {reward_info['compliance']:.2f} | "
                 f"Constraint: {reward_info['constraint']:.2f}"
             )
-
+        # print(f"state shaoe before returning it from step function is {self.state.shape}")
         return self.state.cpu().numpy(), reward, done, False, info
   
 
     def calculate_reward(self):
 
         with torch.no_grad():
-            compliance, constraint = fem.optim(args=self.args, x=self.state.cpu().numpy())
-        #if compliance > 500:
-        #    return -1
-        current_density = self.calculate_total_density()
+            x = self.state.cpu().numpy()
+            x = x[: self.width * self.height]
+            compliance, constraint = fem.optim(args=self.args, x=x)
+
+        penalty_connectivity = self.check_connectivity(x)
 
         w_compliance = self.w_compliance
         w_density_high = self.w_density_high  
@@ -211,7 +232,7 @@ class BeamOptimizationEnv(gym.Env):
         reward_compliance = -w_compliance * (compliance / 100.0)
 
 
-        densities = self.state.cpu().numpy()
+        densities = self.state[:self.width * self.height].cpu().numpy()
 
         density_high_reward = np.mean( (densities - 0.5) ** 2)  
         reward_density_high = w_density_high * density_high_reward
@@ -225,13 +246,15 @@ class BeamOptimizationEnv(gym.Env):
         reward_total_mass = -w_total_mass * mass_deviation
 
 
-        density_entropy = -np.mean(densities * np.log(densities + 1e-8) + 
-                                (1 - densities) * np.log(1 - densities + 1e-8))
+        #density_entropy = -np.mean(densities * np.log(densities + 1e-8) + 
+        #                        (1 - densities) * np.log(1 - densities + 1e-8))
+        density_entropy = -np.mean(densities * np.log(np.clip(densities, 1e-8, None)) +
+                               (1 - densities) * np.log(np.clip(1 - densities, 1e-8, None)))
         reward_entropy = w_entropy * density_entropy
 
         reward = (reward_compliance + #reward_connectivity + reward_isolated +
                 reward_density_high + reward_density_low + reward_total_mass +
-                reward_entropy)
+                reward_entropy - penalty_connectivity)
         
 
         # Large or unbounded rewards can lead to large gradient updates
@@ -266,7 +289,7 @@ class BeamOptimizationEnv(gym.Env):
         Render the current state of the environment.
         """
         if mode == 'human':# and self.current_step % step_interval == 0:
-            grid = self.state.cpu().numpy().reshape(self.height, self.width)
+            grid = self.state[:self.width * self.height].cpu().numpy().reshape(self.height, self.width)
             plt.figure(figsize=(6, 6))
             plt.imshow(grid, cmap='viridis', interpolation='nearest', vmin=0, vmax=1)
             plt.colorbar()

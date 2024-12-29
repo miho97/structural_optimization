@@ -59,20 +59,28 @@ def mbb_beam_2(width=6, height=6, density=0.4, y=1, x=0):
     normals[-1, -1, y] = 1
     normals[0, :, x] = 1
     forces = np.zeros((width + 1, height + 1, 2))
-    forces[0, 0, y] = -1
-    forces[height//2, width, y] = -1
+    forces[0, height, y] = -1
     return normals, forces, density
+
 
 def mbb_beam_3(width=6, height=6, density=0.4, y=1, x=0):  
     normals = np.zeros((width + 1, height + 1, 2))
     normals[-1, -1, y] = 1
     normals[0, :, x] = 1
     forces = np.zeros((width + 1, height + 1, 2))
-    forces[0, 0, y] = -1
-    forces[height//3, width//2, y] = -1
+    forces[width//2, 0, y] = -1
     return normals, forces, density
 
 def mbb_beam_4(width=6, height=6, density=0.4, y=1, x=0):  
+    normals = np.zeros((width + 1, height + 1, 2))
+    normals[-1, -1, y] = 1
+    normals[0, :, x] = 1
+    forces = np.zeros((width + 1, height + 1, 2))
+    forces[int(width//1.5), 0, y] = -1
+    return normals, forces, density
+
+
+def mbb_beam_5(width=6, height=6, density=0.4, y=1, x=0):  
 
     normals = np.zeros((width + 1, height + 1, 2))
     normals[0, height, y] = 1
@@ -244,7 +252,7 @@ def optim( args, x=None, verbose = True):
 
 
 if __name__ == "__main__":
-  args = get_args(*mbb_beam_1())
+  args = get_args(*mbb_beam_2())
   losses,frames,_,_ = fast_stopt(args)
   print(losses)
   print(frames)
