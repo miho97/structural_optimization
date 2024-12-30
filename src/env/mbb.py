@@ -8,7 +8,7 @@ import logging
 
 class BeamOptimizationEnv(gym.Env):
     metadata = {'render.modes': ['human']}  
-    def __init__(self, width=4, height=4, density=0.4, step_size=0.05, optimal_density=0.5, reward_weights = None, beam_type=1 ):
+    def __init__(self, width=4, height=4, density=0.4, step_size=0.1, optimal_density=0.5, reward_weights = None, beam_type=1 ):
         super(BeamOptimizationEnv, self).__init__()
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.width = width
