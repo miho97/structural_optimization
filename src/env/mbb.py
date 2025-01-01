@@ -8,7 +8,7 @@ import logging
 
 class BeamOptimizationEnv(gym.Env):
     metadata = {'render.modes': ['human']}  
-    def __init__(self, width=4, height=4, density=0.4, step_size=0.1, optimal_density=0.5, reward_weights = None, beam_type=1 ):
+    def __init__(self, width=4, height=4, density=0.4, step_size=0.5, optimal_density=0.5, reward_weights = None, beam_type=1 ):
         super(BeamOptimizationEnv, self).__init__()
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.width = width
@@ -20,6 +20,8 @@ class BeamOptimizationEnv(gym.Env):
         self.action_space = gym.spaces.Discrete(2 * self.width * self.height)
         self.state_dim = self.width*self.height  + (self.width + 1)*(self.height + 1) * 2
         self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=(self.state_dim, ), dtype=np.float32)
+        self.step_size_initial = 0.5
+        self.step_size_final = 0.05
         # self.reset()
 
         beam_functions = {
@@ -161,6 +163,14 @@ class BeamOptimizationEnv(gym.Env):
         min_density = 0.001
         max_density = 1.0
 
+        progress = self.current_step / self.max_steps
+        progress = np.clip(progress, 0.0, 1.0)  
+        
+        # Compute dynamic step size: linearly decay from initial to final step size
+        current_step_size = self.step_size_initial - (self.step_size_initial - self.step_size_final) * progress
+        current_step_size = max(current_step_size, self.step_size_final)  
+        self.step_size = current_step_size
+        
         # Current density of the selected cell
         current_density = self.state[cell].item()
 
