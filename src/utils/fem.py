@@ -89,6 +89,40 @@ def mbb_beam_5(width=6, height=6, density=0.4, y=1, x=0):
     forces[width, 0, y] = -1
     return normals, forces, density
 
+def mbb_beam_6(width=6, height=6, density=0.4, y=1, x=0):  
+
+    normals = np.zeros((width + 1, height + 1, 2))
+    normals[0, height, y] = 1
+    normals[width, :, x] = 1
+    forces = np.zeros((width + 1, height + 1, 2))
+    forces[width, height//2, y] = -1
+    return normals, forces, density
+
+def mbb_beam_7(width=6, height=6, density=0.4, y=1, x=0):  
+
+    normals = np.zeros((width + 1, height + 1, 2))
+    normals[0, height, y] = 1
+    normals[width, :, x] = 1
+    forces = np.zeros((width + 1, height + 1, 2))
+    forces[width, int(height//1.5), y] = -1
+    return normals, forces, density
+
+def mbb_beam_8(width=6, height=6, density=0.4, y=1, x=0):  
+
+    normals = np.zeros((width + 1, height + 1, 2))
+    normals[0, height, y] = 1
+    normals[width, :, x] = 1
+    forces = np.zeros((width + 1, height + 1, 2))
+    forces[width, int(height//4), y] = -1
+    return normals, forces, density
+
+def mbb_beam_9(width=6, height=6, density=0.4, y=1, x=0):  # textbook beam example
+    normals = np.zeros((width + 1, height + 1, 2))
+    normals[-1, -width//2, y] = 1
+    normals[0, :, x] = 1
+    forces = np.zeros((width + 1, height + 1, 2))
+    forces[0, width, y] = -1
+    return normals, forces, density
 #'''
 def _get_solver(a_entries, a_indices, size, sym_pos):
   # a is (usu.) symmetric positive; could solve 2x faster w/sksparse.cholmod.cholesky(a).solve_A

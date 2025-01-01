@@ -27,7 +27,11 @@ class BeamOptimizationEnv(gym.Env):
             2: fem.mbb_beam_2,
             3: fem.mbb_beam_3,
             4: fem.mbb_beam_4,
-            5: fem.mbb_beam_5
+            5: fem.mbb_beam_5,
+            6: fem.mbb_beam_6,
+            7: fem.mbb_beam_7,
+            8: fem.mbb_beam_8,
+            9: fem.mbb_beam_9
 
         }
         
