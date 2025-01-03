@@ -22,6 +22,8 @@ class BeamOptimizationEnv(gym.Env):
         self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=(self.state_dim, ), dtype=np.float32)
         self.step_size_initial = 0.5
         self.step_size_final = 0.05
+        self.best_compliance = torch.full((10,), float('inf'), dtype=torch.float32)
+        self.beam_type = beam_type
         # self.reset()
 
         beam_functions = {
@@ -89,7 +91,8 @@ class BeamOptimizationEnv(gym.Env):
         self.previous_compliance = float('inf')
         self.current_constraint = 1.0
         self.reward = 0
-
+        #self.best_copmliance = float('inf')
+        self.current_compliance = float('inf')
         self.state = self.construct_state(temp_state, self.forces)
 
         # print(f"shape of constructed space is {self.state.shape}")
@@ -200,6 +203,14 @@ class BeamOptimizationEnv(gym.Env):
         reward += additional_reward
         reward = reward / (abs(reward) + 1)
 
+        relative_threshold_value = self.best_compliance[self.beam_type] * (0.99)
+        if self.current_compliance < self.best_compliance[self.beam_type]:
+            self.best_compliance[self.beam_type] = self.current_compliance
+        if self.current_compliance < relative_threshold_value:
+            done = True
+            # logging.info(f"Early termination  at step {self.current_step} with compliance {self.current_compliance:.4f}")
+            # print(f"Early termination  at step {self.current_step} with compliance {self.current_compliance:.4f}")
+
         done = self.current_step >= self.max_steps
 
         info = {
@@ -234,6 +245,7 @@ class BeamOptimizationEnv(gym.Env):
             x = self.state.cpu().numpy()
             x = x[: self.width * self.height]
             compliance, constraint = fem.optim(args=self.args, x=x)
+            self.current_compliance = compliance
 
         penalty_connectivity = self.check_connectivity(x)
 
