@@ -24,6 +24,7 @@ class BeamOptimizationEnv(gym.Env):
         self.step_size_final = 0.05
         self.best_compliance = torch.full((10,), float('inf'), dtype=torch.float32)
         self.beam_type = beam_type
+        self.phase_threshold = 0.2
         # self.reset()
 
         beam_functions = {
@@ -99,14 +100,6 @@ class BeamOptimizationEnv(gym.Env):
 
         return self.state.cpu().numpy(),{}
 
-
-
-    def calculate_total_density(self):
-        """
-        Calculate the mean density of the current state.
-        """
-        return np.mean(self.state.cpu().numpy())
-
     def check_connectivity(self, densities):
   
         grid = densities.reshape(self.height, self.width)  # shape (H,W)
@@ -150,6 +143,27 @@ class BeamOptimizationEnv(gym.Env):
             penalty = 2 * others_sum  # scale as you want
             return penalty
 
+    def calculate_total_density(self):
+        """
+        Calculate the mean density of the current state.
+        """
+        return np.mean(self.state.cpu().numpy())
+
+    def get_neighboring_cells(self, cell):
+ 
+        neighbors = []
+        row = cell // self.width
+        col = cell % self.width
+        movements = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1,-1), (1,1)]
+        for dr, dc in movements:
+            new_row = row + dr
+            new_col = col + dc
+            if 0 <= new_row < self.height and 0 <= new_col < self.width:
+                neighbor = new_row * self.width + new_col
+                neighbors.append(neighbor)
+
+        return neighbors
+
     def step(self, action):
         """
         Perform the action and return the new state, reward, done, truncated, and info.
@@ -167,34 +181,60 @@ class BeamOptimizationEnv(gym.Env):
         max_density = 1.0
 
         progress = self.current_step / self.max_steps
-        progress = np.clip(progress, 0.0, 1.0)  
-        
+        progress = np.clip(progress, 0.0, 1.0)
+
+        if progress < self.phase_threshold:
+            phase = 'early'
+        else:
+            phase = 'late'
+
         # Compute dynamic step size: linearly decay from initial to final step size
         current_step_size = self.step_size_initial - (self.step_size_initial - self.step_size_final) * progress
         current_step_size = max(current_step_size, self.step_size_final)  
         self.step_size = current_step_size
         
-        # Current density of the selected cell
-        current_density = self.state[cell].item()
-
         # Initialize reward
         reward = 0.0
         info = {}
+        
+        if phase == 'early':
+            # Early Phase: Modify multiple cells (current cell + neighbors)
+            cells_to_modify = [cell] + self.get_neighboring_cells(cell)
+            for target_cell in cells_to_modify:
+                current_density = self.state[target_cell].item()
+                if direction == 'increase':
+                    new_density = min(current_density + current_step_size, max_density)
+                    if new_density > current_density:
+                        self.state[target_cell] = new_density
+                        reward += 0.05  # Reward for successful increase
+                    else:
+                        reward -= 0.05  # Penalty for hitting the max limit
+                else:  # direction == 'decrease'
+                    new_density = max(current_density - current_step_size, min_density)
+                    if new_density < current_density:
+                        self.state[target_cell] = new_density
+                        reward += 0.05  # Reward for successful decrease
+                    else:
+                        reward -= 0.05 
 
-        if direction == 'increase':
-            new_density = min(current_density + self.step_size, max_density)
-            if new_density == current_density:
-                reward -= 0.1
-            else:
-                self.state[cell] = new_density
-                reward += 0.05  
-        else:  
-            new_density = max(current_density - self.step_size, min_density)
-            if new_density == current_density:
-                reward -= 0.1
-            else:
-                self.state[cell] = new_density
-                reward += 0.05  
+        
+        else:
+            current_density = self.state[cell].item()
+
+            if direction == 'increase':
+                new_density = min(current_density + self.step_size, max_density)
+                if new_density == current_density:
+                    reward -= 0.1
+                else:
+                    self.state[cell] = new_density
+                    reward += 0.05  
+            else:  
+                new_density = max(current_density - self.step_size, min_density)
+                if new_density == current_density:
+                    reward -= 0.1
+                else:
+                    self.state[cell] = new_density
+                    reward += 0.05  
 
         self.current_step += 1
 
@@ -248,7 +288,6 @@ class BeamOptimizationEnv(gym.Env):
             self.current_compliance = compliance
 
         penalty_connectivity = self.check_connectivity(x)
-
         w_compliance = self.w_compliance
         w_density_high = self.w_density_high  
         w_density_low = self.w_density_low
