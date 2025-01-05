@@ -24,7 +24,8 @@ class BeamOptimizationEnv(gym.Env):
         self.step_size_final = 0.05
         self.best_compliance = torch.full((10,), float('inf'), dtype=torch.float32)
         self.beam_type = beam_type
-        self.phase_threshold = 0.2
+        self.phase_threshold_1 = 0.02
+        self.phase_threshold_2 = 0.2
         # self.reset()
 
         beam_functions = {
@@ -64,6 +65,11 @@ class BeamOptimizationEnv(gym.Env):
             self.w_density_low = reward_weights['w_density_low']    
             self.w_total_mass = reward_weights['w_total_mass']
             self.w_entropy = reward_weights['w_entropy']
+
+        self.weight_matrices = {
+            5: self.compute_weight_matrix(size=5),
+            3: self.compute_weight_matrix(size=3)
+        }
 
     def construct_state(self, state, forces):
 
@@ -164,6 +170,57 @@ class BeamOptimizationEnv(gym.Env):
 
         return neighbors
 
+    
+    def compute_weight_matrix(self, size):
+        """
+        Compute a weight matrix for a given subgrid size where central cells have higher weights.
+        
+        Args:
+            size (int): Size of the subgrid (e.g., 5 for 5x5).
+        
+        Returns:
+            torch.Tensor: Weight matrix of shape (size, size).
+        """
+        center = size // 2
+        weights = np.zeros((size, size), dtype=np.float32)
+        max_distance = center
+        for r in range(size):
+            for c in range(size):
+                distance = max(abs(r - center), abs(c - center))
+                # Define weight based on distance
+                if distance == 0:
+                    weight = 1.0
+                elif distance == 1:
+                    weight = 0.8
+                elif distance == 2:
+                    weight = 0.6
+                elif distance == 3:
+                    weight = 0.4
+                elif distance == 4:
+                    weight = 0.2
+                else:
+                    weight = 0.0  # Beyond the subgrid
+                weights[r, c] = weight
+        # Normalize weights to ensure the maximum weight is 1
+        weights /= weights.max()
+        return torch.tensor(weights, dtype=torch.float32, device=self.device)
+    def get_subgrid_cells(self, cell, size):
+
+        subgrid_cells = []
+        half_size = size // 2
+        row = cell // self.width
+        col = cell % self.width
+
+        for dr in range(-half_size, half_size + 1):
+            for dc in range(-half_size, half_size + 1):
+                new_row = row + dr
+                new_col = col + dc
+                if 0 <= new_row < self.height and 0 <= new_col < self.width:
+                    neighbor = new_row * self.width + new_col
+                    subgrid_cells.append(neighbor)
+
+        return subgrid_cells
+
     def step(self, action):
         """
         Perform the action and return the new state, reward, done, truncated, and info.
@@ -183,10 +240,16 @@ class BeamOptimizationEnv(gym.Env):
         progress = self.current_step / self.max_steps
         progress = np.clip(progress, 0.0, 1.0)
 
-        if progress < self.phase_threshold:
-            phase = 'early'
+        if progress < self.phase_threshold_1:
+            phase = 'phase1'  # 5x5 subgrids
+            subgrid_size = 5
+        elif progress < self.phase_threshold_2:
+            phase = 'phase2'  # 3x3 subgrids
+            subgrid_size = 3
+
         else:
-            phase = 'late'
+            phase = 'phase3'  # Single cells
+            subgrid_size = 1
 
         # Compute dynamic step size: linearly decay from initial to final step size
         current_step_size = self.step_size_initial - (self.step_size_initial - self.step_size_final) * progress
@@ -197,44 +260,52 @@ class BeamOptimizationEnv(gym.Env):
         reward = 0.0
         info = {}
         
-        if phase == 'early':
-            # Early Phase: Modify multiple cells (current cell + neighbors)
-            cells_to_modify = [cell] + self.get_neighboring_cells(cell)
-            for target_cell in cells_to_modify:
-                current_density = self.state[target_cell].item()
-                if direction == 'increase':
-                    new_density = min(current_density + current_step_size, max_density)
-                    if new_density > current_density:
-                        self.state[target_cell] = new_density
-                        reward += 0.05  # Reward for successful increase
-                    else:
-                        reward -= 0.05  # Penalty for hitting the max limit
-                else:  # direction == 'decrease'
-                    new_density = max(current_density - current_step_size, min_density)
-                    if new_density < current_density:
-                        self.state[target_cell] = new_density
-                        reward += 0.05  # Reward for successful decrease
-                    else:
-                        reward -= 0.05 
 
+        if subgrid_size >= 2:
+            weights = self.weight_matrices[subgrid_size]  
+            cells_to_modify = self.get_subgrid_cells(cell, size=subgrid_size)  
+            center = subgrid_size // 2
+
+            for idx, target_cell in enumerate(cells_to_modify):
+                # Calculate row and column within the subgrid
+                r = idx // subgrid_size
+                c = idx % subgrid_size
+
+                weight = weights[r, c].item()  
+
+                adjustment = self.step_size * weight if direction == 'increase' else -self.step_size * weight
+
+                current_density = self.state[target_cell].item()
+                new_density = current_density + adjustment
+
+                new_density = np.clip(new_density, min_density, max_density)
+
+                if direction == 'increase' and new_density > current_density:
+                    self.state[ target_cell] = new_density
+                    reward += 0.05 * weight  
+                elif direction == 'decrease' and new_density < current_density:
+                    self.state[ target_cell] = new_density
+                    reward += 0.05 * weight  
+                else:
+                    penalty = -0.05 * weight
+                    reward += penalty
         
         else:
             current_density = self.state[cell].item()
-
             if direction == 'increase':
                 new_density = min(current_density + self.step_size, max_density)
-                if new_density == current_density:
-                    reward -= 0.1
-                else:
+                if new_density > current_density:
                     self.state[cell] = new_density
                     reward += 0.05  
+                else:
+                    reward -= 0.1  
             else:  
                 new_density = max(current_density - self.step_size, min_density)
-                if new_density == current_density:
-                    reward -= 0.1
-                else:
+                if new_density < current_density:
                     self.state[cell] = new_density
                     reward += 0.05  
+                else:
+                    reward -= 0.1   
 
         self.current_step += 1
 
