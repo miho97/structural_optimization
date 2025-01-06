@@ -24,8 +24,8 @@ class BeamOptimizationEnv(gym.Env):
         self.step_size_final = 0.05
         self.best_compliance = torch.full((10,), float('inf'), dtype=torch.float32)
         self.beam_type = beam_type
-        self.phase_threshold_1 = 0.02
-        self.phase_threshold_2 = 0.2
+        self.phase_threshold_1 = 0.1
+        self.phase_threshold_2 = 0.3
         # self.reset()
 
         beam_functions = {
@@ -67,6 +67,7 @@ class BeamOptimizationEnv(gym.Env):
             self.w_entropy = reward_weights['w_entropy']
 
         self.weight_matrices = {
+            7: self.compute_weight_matrix(size=7),
             5: self.compute_weight_matrix(size=5),
             3: self.compute_weight_matrix(size=3)
         }
@@ -90,7 +91,7 @@ class BeamOptimizationEnv(gym.Env):
             np.random.seed(seed)
             torch.manual_seed(seed)
         
-        temp_state = torch.ones((self.width * self.height), dtype=torch.float32, device=self.device)* 0.5
+        temp_state = torch.ones((self.width * self.height), dtype=torch.float32, device=self.device)* self.optimal_density
         self.current_step = 0
         self.visited = torch.zeros((self.width * self.height), dtype=bool, device=self.device)
         self.visited_cells = set()
@@ -313,14 +314,17 @@ class BeamOptimizationEnv(gym.Env):
         additional_reward, reward_info = self.calculate_reward()
         reward += additional_reward
         reward = reward / (abs(reward) + 1)
-
+       
         relative_threshold_value = self.best_compliance[self.beam_type] * (0.99)
         if self.current_compliance < self.best_compliance[self.beam_type]:
             self.best_compliance[self.beam_type] = self.current_compliance
+            # reward += 0.1
         if self.current_compliance < relative_threshold_value:
             done = True
             # logging.info(f"Early termination  at step {self.current_step} with compliance {self.current_compliance:.4f}")
             # print(f"Early termination  at step {self.current_step} with compliance {self.current_compliance:.4f}")
+
+        # reward = reward / (abs(reward) + 1)
 
         done = self.current_step >= self.max_steps
 
@@ -426,7 +430,7 @@ class BeamOptimizationEnv(gym.Env):
         """
         if mode == 'human':# and self.current_step % step_interval == 0:
             grid = self.state[:self.width * self.height].cpu().numpy().reshape(self.height, self.width)
-            plt.figure(figsize=(6, 6))
+            plt.figure(figsize=(6,6))
             plt.imshow(grid, cmap='viridis', interpolation='nearest', vmin=0, vmax=1)
             plt.colorbar()
             plt.title(f"Step: {self.current_step} | Reward: {self.reward:.3f} | Compliance: {self.current_compliance:.3f}")
