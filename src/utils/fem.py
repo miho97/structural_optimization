@@ -43,7 +43,6 @@ def get_args(normals, forces, density=0.4):
   return ObjectView(params)
 
 
-  
 
 def mbb_beam_1(width=6, height=6, density=0.5, y=1, x=0):  
 
@@ -286,7 +285,7 @@ def optim( args, x=None, verbose = True):
 
 
 if __name__ == "__main__":
-  args = get_args(*mbb_beam_2())
+  args = get_args(*mbb_beam_1())
   losses,frames,_,_ = fast_stopt(args)
   print(losses)
   print(frames)

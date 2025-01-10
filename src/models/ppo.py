@@ -281,7 +281,7 @@ class PPO:
         state_values = self.buffer.state_values[:self.buffer.ptr].cpu().numpy()  # Shape: (ptr, num_envs)
         is_terminals = self.buffer.is_terminals[:self.buffer.ptr].cpu().numpy()  # Shape: (ptr, num_envs)
         
-        states = self.buffer.states[:self.buffer.ptr].reshape(-1, self.buffer.num_envs, self.state_dim).cpu().numpy()  # Shape: (ptr, num_envs, state_dim)
+        states = self.buffer.states[:self.buffer.ptr].contiguous().reshape(-1, self.buffer.num_envs, self.state_dim).cpu().numpy()  # Shape: (ptr, num_envs, state_dim)
         actions = self.buffer.actions[:self.buffer.ptr].cpu().numpy()  # Shape: (ptr, num_envs)
         logprobs = self.buffer.logprobs[:self.buffer.ptr].cpu().numpy()  
  
@@ -326,7 +326,7 @@ class PPO:
             total_norm = total_norm ** 0.5
             self.grad_norms.append(total_norm)
 
-            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=0.2)  
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=0.5)  
             self.optimizer.step()
 
             self.actor_losses.append(loss_actor.item())
