@@ -6,6 +6,7 @@ from torch.distributions import Categorical
 import numpy as np
 import matplotlib.pyplot as plt
 from torch import amp
+from torch_geometric.nn import GCNConv, global_mean_pool
 
 # use configuration file or .env for device
 device = torch.device('cpu')

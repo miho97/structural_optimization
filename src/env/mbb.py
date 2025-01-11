@@ -80,7 +80,8 @@ class BeamOptimizationEnv(gym.Env):
             5: fem.optim(fem.get_args(*fem.mbb_beam_5()), x= None)[0],
             6: fem.optim(fem.get_args(*fem.mbb_beam_6()), x= None)[0],
             7: fem.optim(fem.get_args(*fem.mbb_beam_7()), x= None)[0],
-            8: fem.optim(fem.get_args(*fem.mbb_beam_8()), x= None)[0]
+            8: fem.optim(fem.get_args(*fem.mbb_beam_8()), x= None)[0],
+            9: fem.optim(fem.get_args(*fem.mbb_beam_9()), x= None)[0]
 
         }
     def construct_state(self, state, forces):

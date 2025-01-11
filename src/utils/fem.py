@@ -288,10 +288,10 @@ def optim( args, x=None, verbose = True):
 
 
 if __name__ == "__main__":
-  args = get_args(*mbb_beam_1())
+  args = get_args(*mbb_beam_2())
   losses,frames,_,_ = fast_stopt(args)
   print(losses)
   print(frames)
-  compl, constr = optim(args, x= None)
+  compl, constr = optim(args, x= frames)
   print( compl)
   print( constr)
