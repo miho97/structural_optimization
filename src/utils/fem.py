@@ -53,14 +53,17 @@ def mbb_beam_1(width=6, height=6, density=0.5, y=1, x=0):
     forces[0, 0, y] = -1
     return normals, forces, density
 
-def mbb_beam_2(width=6, height=6, density=0.4, y=1, x=0):  
+def mbb_beam_2(width=16, height=16, density=0.2, deck_level=0.2):
+    """A bridge supported by columns at a regular interval."""
+    x_ix, y_ix = 0, 1
     normals = np.zeros((width + 1, height + 1, 2))
-    normals[-1, -1, y] = 1
-    normals[0, :, x] = 1
-    forces = np.zeros((width + 1, height + 1, 2))
-    forces[0, height, y] = -1
-    return normals, forces, density
+    normals[-1, -1, y_ix] = 1
+    normals[-1, :, x_ix] = 1
+    normals[0, :, x_ix] = 1
 
+    forces = np.zeros((width + 1, height + 1, 2))
+    forces[:, round(height * (1 - deck_level)), y_ix] = -1 / width
+    return normals, forces, density
 
 def mbb_beam_3(width=6, height=6, density=0.4, y=1, x=0):  
     normals = np.zeros((width + 1, height + 1, 2))
@@ -289,6 +292,6 @@ if __name__ == "__main__":
   losses,frames,_,_ = fast_stopt(args)
   print(losses)
   print(frames)
-  compl, constr = optim(args, x= frames)
+  compl, constr = optim(args, x= None)
   print( compl)
   print( constr)

@@ -72,6 +72,17 @@ class BeamOptimizationEnv(gym.Env):
             3: self.compute_weight_matrix(size=3)
         }
 
+        self.base_compliance = {
+            1: fem.optim(fem.get_args(*fem.mbb_beam_1()), x= None)[0],
+            2: fem.optim(fem.get_args(*fem.mbb_beam_2()), x= None)[0],
+            3: fem.optim(fem.get_args(*fem.mbb_beam_3()), x= None)[0],
+            4: fem.optim(fem.get_args(*fem.mbb_beam_4()), x= None)[0],
+            5: fem.optim(fem.get_args(*fem.mbb_beam_5()), x= None)[0],
+            6: fem.optim(fem.get_args(*fem.mbb_beam_6()), x= None)[0],
+            7: fem.optim(fem.get_args(*fem.mbb_beam_7()), x= None)[0],
+            8: fem.optim(fem.get_args(*fem.mbb_beam_8()), x= None)[0]
+
+        }
     def construct_state(self, state, forces):
 
         if not isinstance(forces, torch.Tensor):
@@ -315,7 +326,7 @@ class BeamOptimizationEnv(gym.Env):
             # If diff < 0 => got worse
             # Scale it so we don't overshadow main_reward
             improvement_scale = 0.05 # or tweak as needed
-            reward_improvement = improvement_scale * diff  
+            reward_improvement = improvement_scale * diff / self.base_compliance[self.beam_type]
         else:
             reward_improvement = 0.0
 
@@ -370,13 +381,23 @@ class BeamOptimizationEnv(gym.Env):
         penalty_connectivity = self.check_connectivity(x)
 
         # Weighted components
-        r_compliance = -self.w_compliance * (compliance / 100.0)
+        r_compliance = -self.w_compliance * (compliance / self.base_compliance[1])
+        #r_compliance = 100.0 / ( compliance - 20.3)
+        #print(f"r compliance is {r_compliance}")
 
         densities = self.state[: self.width * self.height].cpu().numpy()
         # Example: penalize cells near 0.5 if you want black/white
         # or reward them if you prefer to keep them away from 0.5
-        density_high_reward = np.mean((densities - 0.5)**2)
-        r_density_high = self.w_density_high * density_high_reward
+
+        grey_mask = (densities > 0.2) & (densities < 0.8)
+        fraction_grey = np.mean(grey_mask)  # fraction of cells that are "grey"
+
+        # Negative penalty: the more grey cells, the more negative
+        r_grey = -1* fraction_grey
+
+        #density_high_reward = np.mean((densities - 0.5)**2)
+        #density_high_reward = np.mean(abs(densities - 0.5))
+        #r_density_high = self.w_density_high * density_high_reward
 
         # Similarly for "low" but watch out for double-counting
         density_low_reward = np.mean((0.5 - densities)**2)
@@ -402,12 +423,13 @@ class BeamOptimizationEnv(gym.Env):
         reward = (
             r_compliance
             #+r_density_high
+            + r_grey
             #+ r_density_low
             + r_mass
             #+ r_entropy
             #+ r_connectivity
         )
-
+        # sprint(f"r compliance is {r_compliance} density  is {r_density_high} mass is {r_mass}")
         # Mild clip or no clip
         #reward = np.clip(reward, -100, 100)
 
@@ -416,7 +438,7 @@ class BeamOptimizationEnv(gym.Env):
             'compliance': compliance,
             'constraint': constraint,
             'r_compliance': r_compliance,
-            'r_density_high': r_density_high,
+            #'r_density_high': r_density_high,
             'r_density_low': r_density_low,
             'r_mass': r_mass,
             'r_entropy': r_entropy,

@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -6,6 +5,7 @@ from torch.distributions import MultivariateNormal
 from torch.distributions import Categorical
 import numpy as np
 import matplotlib.pyplot as plt
+from torch import amp
 
 # use configuration file or .env for device
 device = torch.device('cpu')
@@ -186,6 +186,10 @@ class PPO:
         self.policy_old.load_state_dict(self.policy.state_dict())
         
         self.MseLoss = nn.MSELoss()
+        if device.type == 'cuda':
+            self.scaler = amp.GradScaler()
+        else:
+            self.scaler = None
 
     def set_action_std(self, new_action_std):
         if self.has_continuous_action_space:
@@ -296,28 +300,24 @@ class PPO:
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         for epoch in range(self.K_epochs):
-            logprobs_new, state_values_new, dist_entropy = self.policy.evaluate(states, actions)
-            state_values_new = state_values_new.view(-1)
+            with amp.autocast(device_type=device.type):
+                logprobs_new, state_values_new, dist_entropy = self.policy.evaluate(states, actions)
+                state_values_new = state_values_new.view(-1)
 
+                ratios = torch.exp(logprobs_new - logprobs)
+                surr1 = ratios * advantages
+                surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
 
-            ratios = torch.exp(logprobs_new - logprobs)
+                loss_actor = -torch.min(surr1, surr2).mean()
+                loss_critic = self.MseLoss(state_values_new, returns).mean()
+                loss_entropy = -dist_entropy.mean()
 
-            surr1 = ratios * advantages
-            surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
-
-
-            loss_actor = -torch.min(surr1, surr2).mean()
-
-            loss_critic = self.MseLoss(state_values_new, returns).mean()
-
-            loss_entropy = -dist_entropy.mean()
-
-            loss = 2 * loss_actor +  loss_critic + 0.05 * loss_entropy
+                loss = 2*loss_actor + loss_critic + 0.05*loss_entropy
 
             self.optimizer.zero_grad()
-            loss.backward()
+            # scaled backprop:
+            self.scaler.scale(loss).backward()
 
-            # Compute gradient norm
             total_norm = 0.0
             for p in self.policy.parameters():
                 if p.grad is not None:
@@ -326,9 +326,14 @@ class PPO:
             total_norm = total_norm ** 0.5
             self.grad_norms.append(total_norm)
 
-            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=0.5)  
-            self.optimizer.step()
+            # unscale for gradient clipping
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
 
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
+            # log metrics
             self.actor_losses.append(loss_actor.item())
             self.critic_losses.append(loss_critic.item())
             self.entropies.append(dist_entropy.mean().item())
@@ -336,6 +341,7 @@ class PPO:
         self.policy_old.load_state_dict(self.policy.state_dict())
         self.buffer.clear()
         self.scheduler.step()
+
 
 
     def save(self, checkpoint_path):
@@ -432,6 +438,3 @@ class PPO:
         
         if save_path:
             plt.savefig(save_path)
-
-
-
