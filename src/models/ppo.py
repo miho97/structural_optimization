@@ -70,29 +70,29 @@ class ActorCritic(nn.Module):
             )
         else:
             self.actor = nn.Sequential(
-                nn.Linear(state_dim, 128),
-                nn.LayerNorm(128),
+                nn.Linear(state_dim, 512),
+                nn.LayerNorm(512),
                 nn.Tanh(),
                 nn.Dropout(dropout_rate),
-                nn.Linear(128, 128),
-                nn.LayerNorm(128),
+                nn.Linear(512, 512),
+                nn.LayerNorm(512),
                 nn.Tanh(),
                 nn.Dropout(dropout_rate),
-                nn.Linear(128, action_dim),
+                nn.Linear(512, action_dim),
                 nn.Softmax(dim=-1)
             )
 
         # Critic Network
         self.critic = nn.Sequential(
-            nn.Linear(state_dim, 128),
-            nn.LayerNorm(128),
+            nn.Linear(state_dim, 512),
+            nn.LayerNorm(512),
             nn.Tanh(),
             nn.Dropout(dropout_rate),
-            nn.Linear(128, 128),
-            nn.LayerNorm(128),
+            nn.Linear(512, 512),
+            nn.LayerNorm(512),
             nn.Tanh(),
             nn.Dropout(dropout_rate),
-            nn.Linear(128, 1)
+            nn.Linear(512, 1)
         )
 
         # Initialize weights
@@ -313,7 +313,7 @@ class PPO:
                 loss_critic = self.MseLoss(state_values_new, returns).mean()
                 loss_entropy = -dist_entropy.mean()
 
-                loss = 2*loss_actor + loss_critic + 0.05*loss_entropy
+                loss = 2*loss_actor + loss_critic + 0.1*loss_entropy
 
             self.optimizer.zero_grad()
             # scaled backprop:
