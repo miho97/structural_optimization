@@ -44,7 +44,7 @@ def get_args(normals, forces, density=0.4):
 
 
 
-def mbb_beam_1(width=6, height=6, density=0.5, y=1, x=0):  
+def mbb_beam_1(width=20, height=8, density=0.4, y=1, x=0):  
 
     normals = np.zeros((width + 1, height + 1, 2))
     normals[-1, -1, y] = 1
@@ -169,10 +169,11 @@ def objective_calc(x, args, volume_contraint=False, use_filter=False):
   x_phys = physical_density(x, args, volume_contraint=volume_contraint, use_filter=use_filter)
   ke     = get_stiffness_matrix(args.young, args.poisson)  # stiffness matrix
   u      = displace(x_phys, ke, args.forces, args.freedofs, args.fixdofs, **kwargs)
-  c      = compliance_calc(x_phys, u, ke, **kwargs)
+  #c      = compliance_calc(x_phys, u, ke, **kwargs)
+  c, c_local = compliance_calc_elementwise(x_phys, u, ke, **kwargs)
   #print("x_phys= ",  x_phys)
   #print("compliance = ", c)
-  return c
+  return c_local
 def compliance_calc(x_phys, u, ke, *, penal=3, e_min=1e-9, e_0=1):
   nely, nelx = x_phys.shape
   ely, elx = anp.meshgrid(range(nely), range(nelx))  # x, y coords for the index map
@@ -188,6 +189,56 @@ def compliance_calc(x_phys, u, ke, *, penal=3, e_min=1e-9, e_0=1):
   ce = anp.einsum('ijk,ijk->jk', u_selected, ke_u)
   C = young_modulus(x_phys, e_0, e_min, p=penal) * ce.T
   return anp.sum(C)
+
+def compliance_calc_elementwise(x_phys, u, ke, *, penal=3, e_min=1e-9, e_0=1):
+  nely, nelx = x_phys.shape
+  ely, elx = anp.meshgrid(range(nely), range(nelx))  # x, y coords for the index map
+
+  n1 = (nely+1)*(elx+0) + (ely+0)  # nodes
+  n2 = (nely+1)*(elx+1) + (ely+0)
+  n3 = (nely+1)*(elx+1) + (ely+1)
+  n4 = (nely+1)*(elx+0) + (ely+1)
+  all_ixs = anp.array([2*n1, 2*n1+1, 2*n2, 2*n2+1, 2*n3, 2*n3+1, 2*n4, 2*n4+1])
+  u_selected = u[all_ixs]  # select from u matrix
+
+  ke_u = anp.einsum('ij,jkl->ikl', ke, u_selected)  # compute x^penal * U.T @ ke @ U
+  ce = anp.einsum('ijk,ijk->jk', u_selected, ke_u)
+  C_local = young_modulus(x_phys, e_0, e_min, p=penal) * ce.T
+  return C_local, anp.sum(C_local)
+
+def elementwise_strain_energy(x, args):
+
+    x_phys = x.reshape(args.nely, args.nelx)
+    ke = get_stiffness_matrix(args.young, args.poisson)
+    u  = displace(
+        x_phys, ke, args.forces, 
+        args.freedofs, args.fixdofs, 
+        penal=args.penal, e_min=args.young_min, e_0=args.young
+    )
+    c_local,c = compliance_calc_elementwise(
+        x_phys, u, ke, 
+        penal=args.penal, e_min=args.young_min, e_0=args.young
+    )
+    return c_local
+
+import autograd
+
+def compliance_sensitivity(x, args):
+
+    x_flat = x.ravel()
+
+    def c_fn(x_var):
+        # x_var is 1D
+        x_2d = x_var.reshape(args.nely, args.nelx)
+        return objective_calc(x_2d, args)
+
+    # Use autograd to get both compliance and gradient
+    c_val, grad_val = autograd.value_and_grad(c_fn)(x_flat)
+
+    # grad_val shape = [nely*nelx], so reshape it:
+    grad_2d = grad_val.reshape(args.nely, args.nelx)
+    return c_val, grad_2d
+
 
 def get_stiffness_matrix(e, nu):  # e=young's modulus, nu=poisson coefficient
   k = anp.array([1/2-nu/6, 1/8+nu/8, -1/4-nu/12, -1/8+3*nu/8,
@@ -284,14 +335,17 @@ def optim( args, x=None, verbose = True):
     reshape = lambda x: x.reshape(args.nely, args.nelx)
     objective_fn = lambda x: objective_calc(reshape(x), args) # don't enforce mass constraint here
     constraint = lambda params: mean_density(reshape(params), args) 
+    #return elementwise_strain_energy(x, args), constraint(x)
     return objective_calc(x, args), constraint(x)  #losses[-1]
 
 
 if __name__ == "__main__":
-  args = get_args(*mbb_beam_2())
+  args = get_args(*mbb_beam_1())
   losses,frames,_,_ = fast_stopt(args)
   print(losses)
   print(frames)
   compl, constr = optim(args, x= frames)
-  print( compl)
+  print( f"compliance is {compl}")
   print( constr)
+  strain = elementwise_strain_energy(x=frames, args = args)
+  print( strain)

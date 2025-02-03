@@ -18,7 +18,7 @@ class BeamOptimizationEnv(gym.Env):
         self.optimal_density = optimal_density  
         self.max_steps = self.width * self.height * 2
         self.action_space = gym.spaces.Discrete(2 * self.width * self.height)
-        self.state_dim = self.width*self.height  + (self.width + 1)*(self.height + 1) * 2
+        self.state_dim = self.width*self.height * 2  + (self.width + 1)*(self.height + 1) * 2
         self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=(self.state_dim, ), dtype=np.float32)
         self.step_size_initial = 1.0
         self.step_size_final = 0.05
@@ -84,19 +84,32 @@ class BeamOptimizationEnv(gym.Env):
             9: fem.optim(fem.get_args(*fem.mbb_beam_9()), x= None)[0]
 
         }
-    def construct_state(self, state, forces):
 
-        if not isinstance(forces, torch.Tensor):
-            raise TypeError("Forces must be a torch.Tensor")
-        
-        forces_flat = forces.flatten()
-        
-        concatenated_state = torch.cat((state, forces_flat), dim=0)
-        if torch.isnan(concatenated_state).any():
-            print("NaN detected in concatenated state!")
-            concatenated_state = torch.nan_to_num(concatenated_state, nan=0.0)
-        # print(f"shape od concatenadet state is {concatenated_state.shape}")
-        return concatenated_state
+
+    def construct_state(self, densities, normals, forces, strain_array):
+        # 1. Flatten everything
+        #print(type(densities))
+        densities_flat = densities.ravel()
+        normals_flat   = normals.flatten()
+        forces_flat    = forces.ravel()
+        strain_flat    = strain_array.flatten()
+        #print(f"densities flat are of type {type(densities_flat)}")
+        # 2. Normalize strain (using mean-std standardization)
+        strain_mean = strain_flat.mean()
+        strain_std  = strain_flat.std() + 1e-8  # avoid divide-by-zero
+        strain_normalized = (strain_flat - strain_mean) / strain_std
+
+        # 3. Concatenate into a single 1D tensor
+        new_state = torch.cat([
+            densities_flat.clone().detach(),
+            #torch.tensor(densities_flat,      device=self.device, dtype=torch.float32),
+            torch.tensor(strain_normalized,   device=self.device, dtype=torch.float32),
+            # If you want boundary normals:
+            # torch.tensor(normals_flat,      device=self.device, dtype=torch.float32),
+            forces_flat.clone().detach()#torch.tensor(forces_flat,         device=self.device, dtype=torch.float32)
+        ], dim=0)
+
+        return new_state
 
     def reset(self,*, seed=None, options=None):
         if seed is not None:
@@ -113,12 +126,13 @@ class BeamOptimizationEnv(gym.Env):
         self.reward = 0
         #self.best_copmliance = float('inf')
         self.current_compliance = float('inf')
-        self.state = self.construct_state(temp_state, self.forces)
+        strain = fem.elementwise_strain_energy( x= temp_state.cpu().numpy(), args = self.args)
+
+        self.state = self.construct_state(temp_state, self.normals, self.forces, strain)
 
         # print(f"shape of constructed space is {self.state.shape}")
 
         return self.state.cpu().numpy(),{}
-
     def check_connectivity(self, densities):
   
         grid = densities.reshape(self.height, self.width)  # shape (H,W)
@@ -234,12 +248,14 @@ class BeamOptimizationEnv(gym.Env):
 
         return subgrid_cells
 
+###################################################
+#   standard approach with compliance every step  #
+###################################################
+
     def step(self, action):
         """
         Perform the action and return the new state, reward, done, truncated, and info.
         """
-
-        # --- 1) Map action to cell index + direction ---
         total_cells = self.width * self.height
         if action < 0 or action >= 2 * total_cells:
             raise ValueError(f"Invalid action: {action}")
@@ -248,62 +264,39 @@ class BeamOptimizationEnv(gym.Env):
         direction = 'increase' if action >= total_cells else 'decrease'
 
         # --- 2) Determine subgrid (phase) based on training progress ---
-        progress = self.current_step / self.max_steps
-        progress = np.clip(progress, 0.0, 1.0)
+        progress = np.clip(self.current_step / self.max_steps, 0.0, 1.0)
+        # For now, subgrid_size remains 1 (but can be changed later)
+        #subgrid_size = 1
 
-        if progress < self.phase_threshold_1:
-            subgrid_size = 1
-        elif progress < self.phase_threshold_2:
-            subgrid_size = 1
-        else:
-            subgrid_size = 1
-
+        subgrid_size = 1
         # --- 3) Step size decay ---
-        current_step_size = (
-            self.step_size_initial
-            - (self.step_size_initial - self.step_size_final) * progress
-        )
-        current_step_size = max(current_step_size, self.step_size_final)
-        self.step_size = current_step_size
+        current_step_size = self.step_size_initial - (self.step_size_initial - self.step_size_final) * progress
+        self.step_size = max(current_step_size, self.step_size_final)
 
-        # --- 4) Keep track of compliance BEFORE the action ---
-        # If this is the very first step, self.current_compliance might not be set yet.
-        # So handle that case gracefully:
+        # --- 4) Record compliance BEFORE the action ---
         compliance_before = self.previous_compliance
 
-        # --- 5) Apply the action (coarse or single-cell) ---
+        # --- 5) Apply the action ---
         reward_action = 0.0
         if subgrid_size >= 2:
-            # Modify subgrid
             cells_to_modify = self.get_subgrid_cells(cell, size=subgrid_size)
-            weights = self.weight_matrices[subgrid_size]  # e.g., shape (5,5) or (3,3)
-
+            weights = self.weight_matrices[subgrid_size]
             for idx, target_cell in enumerate(cells_to_modify):
                 r = idx // subgrid_size
                 c = idx % subgrid_size
                 w = weights[r, c].item()
-
-                # positive or negative update
                 delta = self.step_size * w if direction == 'increase' else -self.step_size * w
-
                 old_density = self.state[target_cell].item()
                 new_density = np.clip(old_density + delta, 0.001, 1.0)
-
                 if new_density != old_density:
-                    # small reward for successfully changing density
                     self.state[target_cell] = new_density
                     reward_action += 0.05 * w
                 else:
-                    # penalty if we hit a boundary
                     reward_action -= 0.05 * w
         else:
-            # Single cell
             old_density = self.state[cell].item()
-            if direction == 'increase':
-                new_density = min(old_density + self.step_size, 1.0)
-            else:
-                new_density = max(old_density - self.step_size, 0.001)
-
+            new_density = (min(old_density + self.step_size, 1.0) if direction == 'increase'
+                        else max(old_density - self.step_size, 0.001))
             if new_density != old_density:
                 self.state[cell] = new_density
                 reward_action += 0.05
@@ -312,47 +305,38 @@ class BeamOptimizationEnv(gym.Env):
 
         self.current_step += 1
 
-        # --- 6) Compute domain-specific reward (compliance, mass, etc.) ---
-        main_reward, reward_info = self.calculate_reward() 
-        # This sets self.current_compliance internally, so now we have the AFTER compliance.
+        # --- 6) Compute domain-specific reward ---
+        main_reward, reward_info = self.calculate_reward()  # this updates self.current_compliance
 
-        # --- 7) Intermediate compliance-improvement reward ---
+        # --- 7) Compute improvement reward ---
         compliance_after = self.current_compliance
         self.previous_compliance = self.current_compliance
-        diff = 0
-        #print(f"compliance currently is {compliance_after}")
-        if compliance_before <  int(1e4):
-            diff = compliance_before - compliance_after
-            # If diff > 0 => compliance improved
-            # If diff < 0 => got worse
-            # Scale it so we don't overshadow main_reward
-            improvement_scale = 0.05 # or tweak as needed
-            reward_improvement = improvement_scale * diff / self.base_compliance[self.beam_type]
+        if compliance_before < 1e4 and compliance_before > 0:
+            # Reward is proportional to the relative improvement in compliance.
+            improvement = (compliance_before - compliance_after) / (compliance_before + 1e-8)
+            r_improve = 0.05 *  improvement
         else:
-            reward_improvement = 0.0
+            r_improve = 0.0
 
-        # Combine everything
-        reward = reward_action + main_reward + reward_improvement
+        # --- Combine rewards ---
+        # Sum the action reward, domain-specific reward, and improvement reward.
+        reward = reward_action + main_reward + r_improve
 
-        # Optionally, do mild scaling or clipping
-        reward = reward / (1 + abs(reward)) #np.clip(reward, -5.0, 5.0)
+        # Optionally clip or scale the final reward to keep it in a controlled range.
+        reward = np.clip(reward, -1.0, 1.0)
 
-
-        if self.current_compliance < self.best_compliance[self.beam_type] :
+        # Bonus for setting a new best compliance.
+        if self.current_compliance < self.best_compliance[self.beam_type]:
             self.best_compliance[self.beam_type] = self.current_compliance
-            reward += 0.1  # small bonus for setting a new best
-            #done = True
+            reward += 0.0
 
         done = (self.current_step >= self.max_steps)
-            #if done:
-                #print(f"here motherfucke is done since {self.current_step}")
 
-        # Info dict
         info = {
             'compliance_before': compliance_before,
             'compliance_after': compliance_after,
-            'compliance_diff': diff ,
-            'reward_improvement': reward_improvement,
+            'compliance_diff': compliance_before - compliance_after,
+            'r_improve': r_improve,
             'reward_action': reward_action,
             'reward_main': main_reward,
             'compliance': self.current_compliance,
@@ -361,102 +345,544 @@ class BeamOptimizationEnv(gym.Env):
             'direction': direction,
             'step': self.current_step,
         }
-
         return self.state.cpu().numpy(), reward, done, False, info
-  
 
     def calculate_reward(self):
         # Evaluate compliance, constraint, etc.
         with torch.no_grad():
-            x = self.state.cpu().numpy()[: self.width * self.height]
-            compliance, constraint = fem.optim(args=self.args, x=x)
+            x = self.state[: self.width * self.height]
+            compliance, constraint = fem.optim(args=self.args, x=x.cpu().numpy())
+            strain = fem.elementwise_strain_energy(x=x.cpu().numpy(), args=self.args)
+            new_state = self.construct_state(x, self.normals, self.forces, strain)
+            self.state = new_state
 
         self.current_compliance = compliance
         self.current_constraint = constraint
 
-        # If compliance is huge, let's clamp or heavily penalize it
+        # If compliance is very high, then we return a heavy penalty.
         if compliance > 1e5:
-            # or some large negative reward
-            return -10.0, {'raw_reward': -100.0, 'compliance': compliance, 'constraint': constraint}
+            return -10.0, {'raw_reward': -10.0, 'compliance': compliance, 'constraint': constraint}
 
-        penalty_connectivity = self.check_connectivity(x)
+        # --- Component 1: Normalized Compliance Reward ---
+        # Measure relative error (if compliance is lower than the baseline, that’s good)
+        # Here, lower compliance is desired so we take error = (compliance - baseline) / baseline.
+        baseline = self.base_compliance[self.beam_type]
+        # print(f"baseline compo+liance is {baseline}")
+        compliance_error = (compliance - baseline) / (baseline + 1e-8)  
+        # Negative error gives a positive reward (since lower compliance is better)
+        r_compliance = -self.w_compliance * compliance_error
 
-        # Weighted components
-        r_compliance = -self.w_compliance * (compliance / self.base_compliance[1])
-        #r_compliance = 100.0 / ( compliance - 20.3)
-        #print(f"r compliance is {r_compliance}")
-
+        # --- Component 2: Normalized Mass Penalty ---
         densities = self.state[: self.width * self.height].cpu().numpy()
-        # Example: penalize cells near 0.5 if you want black/white
-        # or reward them if you prefer to keep them away from 0.5
-
-        grey_mask = (densities > 0.2) & (densities < 0.8)
-        fraction_grey = np.mean(grey_mask)  # fraction of cells that are "grey"
-
-        # Negative penalty: the more grey cells, the more negative
-        r_grey = -1* fraction_grey
-
-        #density_high_reward = np.mean((densities - 0.5)**2)
-        #density_high_reward = np.mean(abs(densities - 0.5))
-        #r_density_high = self.w_density_high * density_high_reward
-
-        # Similarly for "low" but watch out for double-counting
-        density_low_reward = np.mean((0.5 - densities)**2)
-        r_density_low = self.w_density_low * density_low_reward
-
-        # Mass penalty or deviation
         total_mass = np.sum(densities)
-        target_total_density = self.optimal_density * self.width * self.height
-        mass_deviation = max(total_mass - target_total_density, 0)
+        target_total_mass = self.optimal_density * self.width * self.height
+        mass_deviation = (total_mass - target_total_mass) / (target_total_mass + 1e-8)
         r_mass = -self.w_total_mass * mass_deviation
 
-        # Entropy
-        density_entropy = -np.mean(
-            densities * np.log(np.clip(densities, 1e-8, None)) +
-            (1 - densities) * np.log(np.clip(1 - densities, 1e-8, None))
-        )
-        r_entropy = self.w_entropy * density_entropy
+        # --- Component 3: Constraint Penalty (if applicable) ---
+        r_constraint = 0.0
+        self.constraint_threshold = 0.45
+        if constraint > self.constraint_threshold:  # you can define a threshold
+            r_constraint = -1* ((constraint - self.constraint_threshold) / self.constraint_threshold)
 
-        # Connectivity penalty
-        r_connectivity = -penalty_connectivity
+        # --- Combine Domain-Specific Reward ---
+        # You may choose weights here; note that r_compliance is positive when compliance improves.
+        domain_reward = r_compliance + 0.5 * r_mass + r_constraint
+        domain_reward = r_compliance + r_mass #+ r_constraint
+        #domain_reward /= 10 
 
-        # Sum them
-        reward = (
-            r_compliance
-            #+r_density_high
-            + r_grey
-            #+ r_density_low
-            + r_mass
-            #+ r_entropy
-            #+ r_connectivity
-        )
-        # sprint(f"r compliance is {r_compliance} density  is {r_density_high} mass is {r_mass}")
-        # Mild clip or no clip
-        #reward = np.clip(reward, -100, 100)
+        # Clip the domain reward to keep it within a modest range.
+        domain_reward = np.clip(domain_reward, -1.0, 1.0)
 
         info = {
-            'raw_reward': reward,
-            'compliance': compliance,
+            'raw_compliance': compliance,
             'constraint': constraint,
             'r_compliance': r_compliance,
-            #'r_density_high': r_density_high,
-            'r_density_low': r_density_low,
             'r_mass': r_mass,
-            'r_entropy': r_entropy,
-            'r_connectivity': r_connectivity
+            'r_constraint': r_constraint,
+            'domain_reward': domain_reward,
         }
+        return domain_reward, info
 
-        return reward, info
+#######################
+#     Testing         #
+#######################
+    #'''
+    def step(self, action):
+            """
+            Perform the action and return the new state, reward, done, truncated, and info.
+            """
+            total_cells = self.width * self.height
+            if action < 0 or action >= 2 * total_cells:
+                raise ValueError(f"Invalid action: {action}")
+
+            cell = action % total_cells  # which cell
+            direction = 'increase' if action >= total_cells else 'decrease'
+
+            # --- 2) Determine subgrid (phase) based on training progress ---
+            progress = np.clip(self.current_step / self.max_steps, 0.0, 1.0)
+            # For now, subgrid_size remains 1 (but can be changed later)
+            #subgrid_size = 1
+
+            subgrid_size = 1
+            # --- 3) Step size decay ---
+            current_step_size = self.step_size_initial - (self.step_size_initial - self.step_size_final) * progress
+            self.step_size = max(current_step_size, self.step_size_final)
+
+            # --- 4) Record compliance BEFORE the action ---
+            compliance_before = self.previous_compliance
+
+            # --- 5) Apply the action ---
+            reward_action = 0.0
+            if subgrid_size >= 2:
+                cells_to_modify = self.get_subgrid_cells(cell, size=subgrid_size)
+                weights = self.weight_matrices[subgrid_size]
+                for idx, target_cell in enumerate(cells_to_modify):
+                    r = idx // subgrid_size
+                    c = idx % subgrid_size
+                    w = weights[r, c].item()
+                    delta = self.step_size * w if direction == 'increase' else -self.step_size * w
+                    old_density = self.state[target_cell].item()
+                    new_density = np.clip(old_density + delta, 0.001, 1.0)
+                    if new_density != old_density:
+                        self.state[target_cell] = new_density
+                        reward_action += 0.05 * w
+                    else:
+                        reward_action -= 0.05 * w
+            else:
+                old_density = self.state[cell].item()
+                new_density = (min(old_density + self.step_size, 1.0) if direction == 'increase'
+                            else max(old_density - self.step_size, 0.001))
+                if new_density != old_density:
+                    self.state[cell] = new_density
+                    reward_action += 0.00
+                else:
+                    reward_action -= 0.00
+
+            self.current_step += 1
+
+            # --- 6) Compute domain-specific reward ---
+            main_reward, reward_info = self.calculate_reward()  # this updates self.current_compliance
+
+            # --- 7) Compute improvement reward ---
+            compliance_after = self.current_compliance
+            self.previous_compliance = self.current_compliance
+            if compliance_before < 1e4 and compliance_before > 0:
+                # Reward is proportional to the relative improvement in compliance.
+                improvement = (compliance_before - compliance_after) / (compliance_before + 1e-8)
+                r_improve = 0.00 *  improvement
+            else:
+                r_improve = 0.0
+
+            # --- Combine rewards ---
+            # Sum the action reward, domain-specific reward, and improvement reward.
+            reward = reward_action + main_reward + r_improve
+
+            # Optionally clip or scale the final reward to keep it in a controlled range.
+            reward = np.clip(reward, -1.0, 1.0)
+            #reward = reward / ( abs(reward) + 1)
+
+            # Bonus for setting a new best compliance.
+            if self.current_compliance < self.best_compliance[self.beam_type]:
+                self.best_compliance[self.beam_type] = self.current_compliance
+                reward += 0.0
+
+            done = (self.current_step >= self.max_steps)
+
+            info = {
+                'compliance_before': compliance_before,
+                'compliance_after': compliance_after,
+                'compliance_diff': compliance_before - compliance_after,
+                'r_improve': r_improve,
+                'reward_action': reward_action,
+                'reward_main': main_reward,
+                'compliance': self.current_compliance,
+                'constraint': self.current_constraint,
+                'subgrid_size': subgrid_size,
+                'direction': direction,
+                'step': self.current_step,
+            }
+            return self.state.cpu().numpy(), reward, done, False, info
+
+    def calculate_reward(self):
+        with torch.no_grad():
+            x = self.state[: self.width * self.height]
+            compliance, constraint = fem.optim(args=self.args, x=x.cpu().numpy())
+            strain = fem.elementwise_strain_energy(x=x.cpu().numpy(), args=self.args)
+            new_state = self.construct_state(x, self.normals, self.forces, strain)
+            self.state = new_state
+
+        self.current_compliance = compliance
+        self.current_constraint = constraint
+
+        if compliance > 1e5:
+            return -10.0, {'raw_reward': -10.0, 'compliance': compliance, 'constraint': constraint}
+
+        # Use an adaptive or chosen baseline.
+        baseline = self.base_compliance[self.beam_type]/5  # might be 1180
+        # Compute the ratio and take logarithm.
+        # When compliance == baseline, log(1) = 0. For compliance below baseline, log(<1) < 0.
+        ratio = compliance / (baseline + 1e-8)
+        r_compliance = -self.w_compliance * np.log(ratio)  # This becomes positive when compliance < baseline
+
+        densities = self.state[: self.width * self.height].cpu().numpy()
+        total_mass = np.sum(densities)
+        target_total_mass = self.optimal_density * self.width * self.height
+        mass_deviation = (total_mass - target_total_mass) / (target_total_mass + 1e-8)
+        r_mass = -self.w_total_mass * mass_deviation
+
+        r_constraint = 0.0
+        self.constraint_threshold = 0.45
+        if constraint > self.constraint_threshold:
+            r_constraint = -1 * ((constraint - self.constraint_threshold) / self.constraint_threshold)
+
+        domain_reward = r_compliance + r_mass #+ r_constraint
+        domain_reward = np.clip(domain_reward, -1.0, 1.0)
+
+        info = {
+            'raw_compliance': compliance,
+            'constraint': constraint,
+            'r_compliance': r_compliance,
+            'r_mass': r_mass,
+            'r_constraint': r_constraint,
+            'domain_reward': domain_reward,
+        }
+        return domain_reward, info
+    #'''
+####################################
+#     Trying sparse reward         #
+####################################
+    '''
+    def step(self, action):
+        """
+        Perform the action and return the new state, reward, done, truncated, and info.
+        In this version, the immediate reward (from the action) is very small,
+        and an aggregated reward is computed every 10% of the episode.
+        """
+        total_cells = self.width * self.height
+        if action < 0 or action >= 2 * total_cells:
+            raise ValueError(f"Invalid action: {action}")
+
+        cell = action % total_cells  # which cell
+        direction = 'increase' if action >= total_cells else 'decrease'
+
+        # --- 1) Determine progress and step size decay ---
+        progress = np.clip(self.current_step / self.max_steps, 0.0, 1.0)
+        subgrid_size = 1  # we use a single-cell update for now
+        current_step_size = self.step_size_initial - (self.step_size_initial - self.step_size_final) * progress
+        self.step_size = max(current_step_size, self.step_size_final)
+
+        # --- 2) Record compliance BEFORE the action (for aggregation) ---
+        # At the start of the episode, initialize previous_compliance.
+        if self.current_step == 0:
+            # You can choose an initial baseline; here we use self.base_compliance[1] as an example.
+            self.previous_compliance = self.base_compliance[1]
+        compliance_before = self.previous_compliance
+
+        # --- 3) Apply the action ---
+        reward_action = 0.0
+        if subgrid_size >= 2:
+            cells_to_modify = self.get_subgrid_cells(cell, size=subgrid_size)
+            weights = self.weight_matrices[subgrid_size]
+            for idx, target_cell in enumerate(cells_to_modify):
+                r = idx // subgrid_size
+                c = idx % subgrid_size
+                w = weights[r, c].item()
+                delta = self.step_size * w if direction == 'increase' else -self.step_size * w
+                old_density = self.state[target_cell].item()
+                new_density = np.clip(old_density + delta, 0.001, 1.0)
+                if new_density != old_density:
+                    self.state[target_cell] = new_density
+                    reward_action += 0.05 * w  # small local reward if desired
+                else:
+                    reward_action -= 0.05 * w
+        else:
+            old_density = self.state[cell].item()
+            new_density = (min(old_density + self.step_size, 1.0) if direction == 'increase'
+                        else max(old_density - self.step_size, 0.001))
+            if new_density != old_density:
+                self.state[cell] = new_density
+                reward_action += 0.01  # you may set a small value here (or 0)
+            else:
+                reward_action -= 0.01
+
+        self.current_step += 1
+
+        # --- 4) Immediate reward (local signal) ---
+        immediate_reward = reward_action
+
+        # --- 5) Periodically aggregate domain reward every 10% of the episode ---
+        segment_reward = 0.0
+        segment_info = {}
+        segment_interval = int(self.max_steps * 0.1)  # every 10% of episode length
+        # Check if we are at a segment boundary or at the end.
+        if (self.current_step % segment_interval == 0) or (self.current_step >= self.max_steps):
+            segment_reward, segment_info = self.calculate_segment_reward(compliance_before)
+            # Use different multipliers for intermediate and terminal segments.
+            terminal_multiplier = 2.0
+            intermediate_multiplier = 0.5
+            if self.current_step >= self.max_steps:
+                segment_reward *= terminal_multiplier
+            else:
+                segment_reward *= intermediate_multiplier
+            # Update baseline for the next segment.
+            self.previous_compliance = self.current_compliance
+
+        # --- 6) Combine rewards ---
+        total_reward = immediate_reward + segment_reward
+        total_reward = np.clip(total_reward, -1.0, 1.0)
+
+        done = (self.current_step >= self.max_steps)
+
+        # --- 7) Package diagnostic info ---
+        info = {
+            'compliance_before': compliance_before,
+            'compliance_after': self.current_compliance,
+            'compliance_diff': compliance_before - self.current_compliance,
+            'segment_reward': segment_reward,
+            'segment_info': segment_info,
+            'immediate_reward': immediate_reward,
+            'total_reward': total_reward,
+            'step': self.current_step,
+            'compliance': self.current_compliance,
+            'constraint': self.current_constraint,
+        }
+        return self.state.cpu().numpy(), total_reward, done, False, info
 
 
+    def calculate_segment_reward(self, compliance_initial):
+        """
+        This function aggregates the domain-specific metrics over a segment (e.g., 10% of the episode).
+        It computes an aggregated reward based on the current design metrics, comparing the current
+        compliance to a baseline.
+        
+        We use a logarithmic transformation on the compliance ratio, plus a mass penalty.
+        """
+        with torch.no_grad():
+            x = self.state[: self.width * self.height]
+            # Recompute design metrics (this updates self.state as well)
+            compliance, constraint = fem.optim(args=self.args, x=x.cpu().numpy())
+            strain = fem.elementwise_strain_energy(x=x.cpu().numpy(), args=self.args)
+            new_state = self.construct_state(x, self.normals, self.forces, strain)
+            self.state = new_state
 
+        self.current_compliance = compliance
+        self.current_constraint = constraint
+
+        # If compliance is extremely high, return a heavy penalty.
+        if compliance > 1e5:
+            return -10.0, {'raw_reward': -10.0, 'compliance': compliance, 'constraint': constraint}
+
+        # --- Aggregated Compliance Reward ---
+        # Use the baseline (for instance, initial design value, e.g., 1180)
+        baseline = self.base_compliance[self.beam_type] / 10 # e.g., 1180
+        ratio = compliance / (baseline + 1e-8)
+        r_compliance = -self.w_compliance * np.log(ratio)
+        # When compliance < baseline, log(ratio) < 0 so r_compliance > 0
+
+        # --- Aggregated Mass Penalty ---
+        densities = self.state[: self.width * self.height].cpu().numpy()
+        total_mass = np.sum(densities)
+        target_total_mass = self.optimal_density * self.width * self.height
+        mass_deviation = (total_mass - target_total_mass) / (target_total_mass + 1e-8)
+        r_mass = -self.w_total_mass * mass_deviation
+
+        # --- Optional Constraint Penalty ---
+        r_constraint = 0.0
+        self.constraint_threshold = 0.45
+        if constraint > self.constraint_threshold:
+            r_constraint = -1 * ((constraint - self.constraint_threshold) / self.constraint_threshold)
+
+        # Combine aggregated rewards.
+        aggregated_reward = r_compliance + 2 * r_mass + r_constraint
+        aggregated_reward = np.clip(aggregated_reward, -1.0, 1.0)
+
+        info = {
+            'raw_compliance': compliance,
+            'constraint': constraint,
+            'r_compliance': r_compliance,
+            'r_mass': r_mass,
+            'r_constraint': r_constraint,
+            'aggregated_reward': aggregated_reward,
+            'improvement_ratio': (compliance_initial - compliance) / (compliance_initial + 1e-8)
+        }
+        return aggregated_reward, info
+
+#############################################################
+#  less sparse approach but solver stil called every step   #
+#############################################################
+    #'''
+    '''
+    def step(self, action):
+        """
+        Perform the action and return the new state, reward, done, truncated, and info.
+        In this version, the immediate reward (from the action) is very small.
+        We aggregate a reward every 10% of the episode based on the improvement in compliance,
+        and also provide a smaller continuous bonus every 5% of the episode.
+        """
+        total_cells = self.width * self.height
+        if action < 0 or action >= 2 * total_cells:
+            raise ValueError(f"Invalid action: {action}")
+
+        cell = action % total_cells  # which cell
+        direction = 'increase' if action >= total_cells else 'decrease'
+
+        # --- 1) Determine progress and step size decay ---
+        progress = np.clip(self.current_step / self.max_steps, 0.0, 1.0)
+        subgrid_size = 1  # single-cell update for now
+        current_step_size = self.step_size_initial - (self.step_size_initial - self.step_size_final) * progress
+        self.step_size = max(current_step_size, self.step_size_final)
+
+        # --- 2) Record compliance baseline for the segment ---
+        # At the very beginning of the episode, also set the segment baseline.
+        if self.current_step == 0:
+            self.previous_compliance = self.base_compliance[1]
+            self.segment_baseline_compliance = self.previous_compliance
+        compliance_before = self.segment_baseline_compliance
+
+        # --- 3) Apply the action ---
+        reward_action = 0.0
+        if subgrid_size >= 2:
+            cells_to_modify = self.get_subgrid_cells(cell, size=subgrid_size)
+            weights = self.weight_matrices[subgrid_size]
+            for idx, target_cell in enumerate(cells_to_modify):
+                r = idx // subgrid_size
+                c = idx % subgrid_size
+                w = weights[r, c].item()
+                delta = self.step_size * w if direction == 'increase' else -self.step_size * w
+                old_density = self.state[target_cell].item()
+                new_density = np.clip(old_density + delta, 0.001, 1.0)
+                if new_density != old_density:
+                    self.state[target_cell] = new_density
+                    reward_action += 0.05 * w
+                else:
+                    reward_action -= 0.05 * w
+        else:
+            old_density = self.state[cell].item()
+            new_density = (min(old_density + self.step_size, 1.0) if direction == 'increase'
+                        else max(old_density - self.step_size, 0.001))
+            if new_density != old_density:
+                self.state[cell] = new_density
+                reward_action += 0.01  # small immediate reward
+            else:
+                reward_action -= 0.01
+
+        self.current_step += 1
+
+        # --- 4) Immediate reward (local signal) ---
+        immediate_reward = reward_action
+
+        # --- 5) Continuous immediate bonus every 5% of episode ---
+        bonus_reward = 0.0
+        bonus_interval = int(self.max_steps * 0.01)  # every 5% of the episode
+        #if self.current_step % 2 == 0:
+        #    with torch.no_grad():
+        ##        x = self.state[: self.width * self.height]
+        #        compliance_current, _ = fem.optim(args=self.args, x=x.cpu().numpy())
+            # Compute improvement relative to the segment baseline.
+        #    improvement = (self.segment_baseline_compliance - compliance_current) / (self.segment_baseline_compliance + 1e-8)
+        #    alpha_immediate = 0.2  # you can adjust this multiplier
+        #    bonus_reward = alpha_immediate * improvement
+
+        # --- 6) Periodically aggregate domain reward every 10% of the episode ---
+        segment_reward = 0.0
+        segment_info = {}
+        segment_interval = int(self.max_steps * 0.01)  # every 10% of episode length
+        segment_interval = 2
+        if (self.current_step % segment_interval == 0) or (self.current_step >= self.max_steps):
+            segment_reward, segment_info = self.calculate_segment_reward(self.segment_baseline_compliance)
+            # Use a higher multiplier for the terminal segment.
+            terminal_multiplier = 10.0
+            intermediate_multiplier = 1.0
+            if self.current_step >= self.max_steps:
+                segment_reward *= terminal_multiplier
+            else:
+                segment_reward *= intermediate_multiplier
+            # Update the segment baseline for the next segment.
+            self.segment_baseline_compliance = self.current_compliance
+
+        # --- 7) Combine rewards ---
+        total_reward = immediate_reward + bonus_reward + segment_reward
+        total_reward = np.clip(total_reward, -1.0, 1.0)
+        done = (self.current_step >= self.max_steps)
+
+        info = {
+            'compliance_baseline': compliance_before,
+            'compliance_current': self.current_compliance,
+            'compliance_improvement': compliance_before - self.current_compliance,
+            'immediate_reward': immediate_reward,
+            'bonus_reward': bonus_reward,
+            'segment_reward': segment_reward,
+            'segment_info': segment_info,
+            'total_reward': total_reward,
+            'step': self.current_step,
+            'constraint': self.current_constraint,
+            'compliance': self.current_compliance
+        }
+        return self.state.cpu().numpy(), total_reward, done, False, info
+
+
+    def calculate_segment_reward(self, compliance_baseline):
+        """
+        Aggregates domain-specific metrics over the current segment (e.g., 10% of the episode).
+        Computes an aggregated reward based on the current design metrics (compliance, mass, etc.)
+        compared to the segment baseline.
+        """
+        with torch.no_grad():
+            x = self.state[: self.width * self.height]
+            # Recompute design metrics (this call updates self.state)
+            compliance, constraint = fem.optim(args=self.args, x=x.cpu().numpy())
+            strain = fem.elementwise_strain_energy(x=x.cpu().numpy(), args=self.args)
+            new_state = self.construct_state(x, self.normals, self.forces, strain)
+            self.state = new_state
+
+        self.current_compliance = compliance
+        self.current_constraint = constraint
+
+        # If compliance is extremely high, return a heavy penalty.
+        if compliance > 1e5:
+            return -10.0, {'raw_reward': -10.0, 'compliance': compliance, 'constraint': constraint}
+
+        # --- Aggregated Compliance Reward ---
+        # Use the baseline passed from the segment (compliance_baseline)
+        ratio = compliance / (compliance_baseline + 1e-8)
+        r_compliance = -self.w_compliance * np.log(ratio)
+        # When compliance < baseline, np.log(ratio) < 0, so r_compliance becomes positive.
+
+        # --- Aggregated Mass Penalty ---
+        densities = self.state[: self.width * self.height].cpu().numpy()
+        total_mass = np.sum(densities)
+        target_total_mass = self.optimal_density * self.width * self.height
+        mass_deviation = (total_mass - target_total_mass) / (target_total_mass + 1e-8)
+        r_mass = -self.w_total_mass * mass_deviation
+
+        # --- Optional Constraint Penalty ---
+        r_constraint = 0.0
+        self.constraint_threshold = 0.45
+        if constraint > self.constraint_threshold:
+            r_constraint = -1 * ((constraint - self.constraint_threshold) / self.constraint_threshold)
+
+        aggregated_reward = r_compliance + 0.1 * r_mass #+ r_constraint
+        aggregated_reward = np.clip(aggregated_reward, -1.0, 1.0)
+
+        info = {
+            'raw_compliance': compliance,
+            'constraint': constraint,
+            'r_compliance': r_compliance,
+            'r_mass': r_mass,
+            'r_constraint': r_constraint,
+            'aggregated_reward': aggregated_reward,
+            'improvement_ratio': (compliance_baseline - compliance) / (compliance_baseline + 1e-8)
+        }
+        return aggregated_reward, info
+    #'''
 
     def render(self, mode='human', step_interval=100):
         """
         Render the current state of the environment.
         """
         if mode == 'human':# and self.current_step % step_interval == 0:
-            grid = self.state[:self.width * self.height].cpu().numpy().reshape(self.width, self.height)
+            grid = self.state[:self.width * self.height].cpu().numpy().reshape(self.height, self.width)
             plt.figure(figsize=(6,6))
             plt.imshow(grid, cmap='viridis', interpolation='nearest', vmin=0, vmax=1)
             plt.colorbar()
