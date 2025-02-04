@@ -44,7 +44,7 @@ def get_args(normals, forces, density=0.4):
 
 
 
-def mbb_beam_1(width=20, height=8, density=0.4, y=1, x=0):  
+def mbb_beam_1(width=6, height=6, density=0.45, y=1, x=0):  
 
     normals = np.zeros((width + 1, height + 1, 2))
     normals[-1, -1, y] = 1
