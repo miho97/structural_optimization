@@ -44,13 +44,25 @@ def get_args(normals, forces, density=0.4):
 
 
 
-def mbb_beam_1(width=6, height=6, density=0.5, y=1, x=0):  
+def mbb_beam_1(width=25, height=10, density=0.5, y=1, x=0):  
 
     normals = np.zeros((width + 1, height + 1, 2))
     normals[-1, -1, y] = 1
     normals[0, :, x] = 1
     forces = np.zeros((width + 1, height + 1, 2))
     forces[0, 0, y] = -1
+    return normals, forces, density
+
+def mbb_beam_11(width=12, height=6, density=0.45, y=1, x=0):
+
+    normals = np.zeros((width + 1, height + 1, 2))
+    forces = np.zeros((width + 1, height + 1, 2))
+    normals[0, 0, 0] = 1  
+    normals[0, 0, 1] = 1   
+    normals[-1, 0, 1] = 1 
+    mid_index = (width + 1) // 2
+    forces[mid_index, -1, 1] = -1  
+    
     return normals, forces, density
 
 def mbb_beam_2(width=16, height=16, density=0.2, deck_level=0.2):
@@ -288,10 +300,10 @@ def optim( args, x=None, verbose = True):
 
 
 if __name__ == "__main__":
-  args = get_args(*mbb_beam_2())
+  args = get_args(*mbb_beam_1())
   losses,frames,_,_ = fast_stopt(args)
   print(losses)
   print(frames)
   compl, constr = optim(args, x= frames)
-  print( compl)
+  print(f" compliacne is {compl}")
   print( constr)
