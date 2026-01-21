@@ -10,28 +10,30 @@ from torch import amp
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 class RolloutBuffer:
-    def __init__(self, max_size, num_envs, channels, width, height, action_dtype=torch.long):
+    def __init__(self, max_size, num_envs, channels, width, height, action_dtype=torch.long, buffer_device='cpu'):
         self.num_envs = num_envs
         self.max_size = max_size
         self.ptr = 0
+        self.buffer_device = buffer_device
 
-        # States: [max_size, num_envs, channels, width, height]
-        self.states = torch.zeros((max_size, num_envs, channels, width, height), device=device)
-        self.actions = torch.zeros((max_size, num_envs), dtype=action_dtype, device=device)  
-        self.logprobs = torch.zeros((max_size, num_envs), device=device)
-        self.rewards = torch.zeros((max_size, num_envs), device=device)
-        self.state_values = torch.zeros((max_size, num_envs), device=device)
-        self.is_terminals = torch.zeros((max_size, num_envs), dtype=torch.bool, device=device)
+        # States: [max_size, num_envs, channels, width, height] - stored on CPU to save GPU memory
+        self.states = torch.zeros((max_size, num_envs, channels, width, height), device=buffer_device)
+        self.actions = torch.zeros((max_size, num_envs), dtype=action_dtype, device=buffer_device)  
+        self.logprobs = torch.zeros((max_size, num_envs), device=buffer_device)
+        self.rewards = torch.zeros((max_size, num_envs), device=buffer_device)
+        self.state_values = torch.zeros((max_size, num_envs), device=buffer_device)
+        self.is_terminals = torch.zeros((max_size, num_envs), dtype=torch.bool, device=buffer_device)
 
     def store(self, states, actions, logprobs, rewards, state_values, is_terminals):
         if self.ptr >= self.max_size:
             raise IndexError("RolloutBuffer is full")
-        self.states[self.ptr] = states  # Expecting [num_envs, channels, width, height]
-        self.actions[self.ptr] = actions
-        self.logprobs[self.ptr] = logprobs
-        self.rewards[self.ptr] = rewards
-        self.state_values[self.ptr] = state_values
-        self.is_terminals[self.ptr] = is_terminals
+        # Move tensors to buffer device (CPU) for storage
+        self.states[self.ptr] = states.to(self.buffer_device)
+        self.actions[self.ptr] = actions.to(self.buffer_device)
+        self.logprobs[self.ptr] = logprobs.to(self.buffer_device)
+        self.rewards[self.ptr] = rewards.to(self.buffer_device)
+        self.state_values[self.ptr] = state_values.to(self.buffer_device)
+        self.is_terminals[self.ptr] = is_terminals.to(self.buffer_device)
         self.ptr += 1
 
     def clear(self):
@@ -58,16 +60,16 @@ class CNNActorCritic(nn.Module):
         self.height = height
         self.flatten_dim = 128 * self.width * self.height
 
-        # Fully connected layers
+        # Fully connected layers (ReLU + 10% dropout for better gradient flow)
         self.fc_actor = nn.Sequential(
             nn.Linear(self.flatten_dim, 256),
             nn.LayerNorm(256),
-            nn.Tanh(),
-            nn.Dropout(dropout_rate),
+            nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(256, 256),
             nn.LayerNorm(256),
-            nn.Tanh(),
-            nn.Dropout(dropout_rate),
+            nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(256, num_actions),
             nn.Tanh() if has_continuous_action_space else nn.Softmax(dim=-1)
         )
@@ -75,12 +77,12 @@ class CNNActorCritic(nn.Module):
         self.fc_critic = nn.Sequential(
             nn.Linear(self.flatten_dim, 256),
             nn.LayerNorm(256),
-            nn.Tanh(),
-            nn.Dropout(dropout_rate),
+            nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(256, 256),
             nn.LayerNorm(256),
-            nn.Tanh(),
-            nn.Dropout(dropout_rate),
+            nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(256, 1)
         )
 
@@ -175,13 +177,14 @@ class PPO:
         self.width = width
         self.height = height
 
-        # Initialize buffer
+        # Initialize buffer on CPU to save GPU memory
         self.buffer = RolloutBuffer(
-            max_size=10000, 
+            max_size=500,  # Reduced from 10000 - only need enough for a few episodes
             num_envs=num_envs, 
             channels=state_channels, 
-            width=width+1, 
-            height=height+1
+            width=width, 
+            height=height,
+            buffer_device='cpu'
         )
 
         # Initialize ActorCritic
@@ -257,6 +260,7 @@ class PPO:
         Returns:
             Tuple: (actions, logprobs, state_values)
         """
+        self.policy_old.eval()  # Disable dropout, use running BatchNorm stats for inference
         with torch.no_grad():
             actions, logprobs, state_values = self.policy_old.act(states)
         return actions, logprobs, state_values
@@ -317,7 +321,7 @@ class PPO:
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         for epoch in range(self.K_epochs):
-            with amp.autocast(enabled=(device.type == 'cuda')):
+            with amp.autocast(device_type=device.type, enabled=(device.type == 'cuda')):
                 logprobs_new, state_values_new, dist_entropy = self.policy.evaluate(states, actions)
                 state_values_new = state_values_new.view(-1)
 

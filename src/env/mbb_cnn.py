@@ -13,7 +13,8 @@ class BeamOptimizationEnv(gym.Env):
     def __init__(self, width=4, height=4, density=0.4, step_size=0.5, 
                  optimal_density=0.5, reward_weights=None, beam_type=1):
         super(BeamOptimizationEnv, self).__init__()
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # Environments run on CPU; only the PPO model uses GPU for batched inference
+        self.device = 'cpu'
         self.width = width
         self.height = height
         self.density = density
@@ -81,9 +82,12 @@ class BeamOptimizationEnv(gym.Env):
             3: self.compute_weight_matrix(size=3)
         }
 
+        # Only compute base_compliance for the beam type being used (9x faster startup)
         self.base_compliance = {
-            beam_type: fem.optim(fem.get_args(*beam_func()), x=None)[0]
-            for beam_type, beam_func in beam_functions.items()
+            self.beam_type: fem.optim(
+                fem.get_args(*beam_functions[self.beam_type](width, height, density)), 
+                x=None
+            )[0]
         }
 
         self.reset()
@@ -133,9 +137,13 @@ class BeamOptimizationEnv(gym.Env):
         self.current_step = 0
         self.visited = torch.zeros((self.width * self.height), dtype=torch.bool, device=self.device)
         self.visited_cells = set()
-        self.current_compliance = float('inf')
-        self.previous_compliance = float('inf')
-        self.current_constraint = 1.0
+        
+        # Compute initial compliance so first step has valid baseline for improvement reward
+        densities_np = densities.cpu().numpy()
+        initial_compliance, initial_constraint = fem.optim(args=self.args, x=densities_np)
+        self.current_compliance = initial_compliance
+        self.previous_compliance = initial_compliance  # Now first step can compute improvement!
+        self.current_constraint = initial_constraint
         self.reward = 0
         
         # Construct the initial state
@@ -390,88 +398,6 @@ class BeamOptimizationEnv(gym.Env):
         }
 
         return self.state.cpu().numpy(), reward, done, False, info
-
-    def calculate_reward(self):
-        """
-        Calculate the reward based on compliance and constraints.
-        """
-        # Extract densities and forces from the state
-        densities_padded = self.state[0, :, :].cpu().numpy()  # Shape: (width+1, height+1)
-        normals_x = self.state[1, :, :].cpu().numpy()
-        normals_y = self.state[2, :, :].cpu().numpy()
-        forces_x = self.state[3, :, :].cpu().numpy()
-        forces_y = self.state[4, :, :].cpu().numpy()
-
-        # Flatten densities back to original grid size
-        densities = densities_padded[:self.width, :self.height]  # Shape: (width, height)
-        
-        # Flatten forces
-        forces = np.stack([forces_x, forces_y], axis=-1).reshape(-1, 2)  # Shape: (number_of_edges, 2)
-        
-        # Compute compliance and constraint
-        compliance, constraint = fem.optim(args=self.args, x=densities)
-        
-        self.current_compliance = compliance
-        self.current_constraint = constraint
-        
-        # Heavy penalty if compliance is excessively large
-        if compliance > 1e5:
-            return -10.0, {'raw_reward': -100.0, 'compliance': compliance, 'constraint': constraint}
-        
-        # Penalty for connectivity issues
-        penalty_connectivity = self.check_connectivity(densities)
-        
-        # Weighted components
-        r_compliance = -self.w_compliance * (compliance / self.base_compliance[self.beam_type])
-        
-        # Grey mask for densities between 0.2 and 0.8
-        grey_mask = (densities > 0.2) & (densities < 0.8)
-        fraction_grey = np.mean(grey_mask)  # Fraction of cells that are "grey"
-        
-        r_grey = -1 * fraction_grey
-        
-        # Density low reward
-        density_low_reward = np.mean((0.5 - densities) ** 2)
-        r_density_low = self.w_density_low * density_low_reward
-        
-        # Mass penalty or deviation
-        total_mass = np.sum(densities)
-        target_total_density = self.optimal_density * self.width * self.height
-        mass_deviation = max(total_mass - target_total_density, 0)
-        r_mass = -self.w_total_mass * mass_deviation
-        
-        # Entropy
-        density_entropy = -np.mean(
-            densities * np.log(np.clip(densities, 1e-8, None)) +
-            (1 - densities) * np.log(np.clip(1 - densities, 1e-8, None))
-        )
-        r_entropy = self.w_entropy * density_entropy
-        
-        # Connectivity penalty
-        r_connectivity = -penalty_connectivity
-        
-        # Sum them
-        reward = (
-            r_compliance
-            + r_grey
-            + r_density_low
-            + r_mass
-            # + r_entropy
-            # + r_connectivity
-        )
-        
-        info = {
-            'raw_reward': reward,
-            'compliance': compliance,
-            'constraint': constraint,
-            'r_compliance': r_compliance,
-            'r_density_low': r_density_low,
-            'r_mass': r_mass,
-            'r_entropy': r_entropy,
-            'r_connectivity': r_connectivity
-        }
-        
-        return reward, info
 
     def render(self, mode='human', step_interval=100):
         """
