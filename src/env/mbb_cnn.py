@@ -7,11 +7,96 @@ from utils import fem
 import logging
 import torch.nn.functional as F
 
+
+def generate_random_beam(width, height, density=0.4):
+    """
+    Generate a random but VALID beam configuration.
+    
+    Uses one of three valid structural templates:
+    - cantilever: One edge fully fixed, force on opposite side
+    - simply_supported: Both ends supported, force on top
+    - corner_supported: MBB-style with edge + corner support
+    
+    Returns:
+        normals: np.ndarray of shape (width+1, height+1, 2)
+        forces: np.ndarray of shape (width+1, height+1, 2)
+        density: float
+    """
+    normals = np.zeros((width + 1, height + 1, 2))
+    forces = np.zeros((width + 1, height + 1, 2))
+    
+    # Pick a random valid template
+    template = np.random.choice(['cantilever', 'simply_supported', 'corner_supported'])
+    
+    if template == 'cantilever':
+        # Fix one edge (left or right), force anywhere on opposite side
+        fixed_edge = np.random.choice(['left', 'right'])
+        if fixed_edge == 'left':
+            normals[0, :, 0] = 1  # Fix left edge in X
+            normals[0, 0, 1] = 1  # Pin bottom-left in Y (minimum constraint)
+            normals[0, height, 1] = 1  # Pin top-left in Y
+            force_x = width  # Force on right side
+        else:
+            normals[width, :, 0] = 1  # Fix right edge in X
+            normals[width, 0, 1] = 1  # Pin bottom-right in Y
+            normals[width, height, 1] = 1  # Pin top-right in Y
+            force_x = 0  # Force on left side
+        
+        force_y = np.random.randint(0, height + 1)
+        forces[force_x, force_y, 1] = -1  # Downward force
+        
+    elif template == 'simply_supported':
+        # Pin both bottom corners, force somewhere on top
+        normals[0, height, 1] = 1       # Left bottom corner Y
+        normals[width, height, 1] = 1   # Right bottom corner Y
+        normals[0, height, 0] = 1       # Left bottom corner X (prevent sliding)
+        
+        # Force on top edge (not at corners)
+        force_x = np.random.randint(1, width)
+        forces[force_x, 0, 1] = -1
+        
+    elif template == 'corner_supported':
+        # MBB-style: one edge X-fixed, one corner Y-pinned
+        # Randomly choose orientation
+        if np.random.random() < 0.5:
+            # Left edge fixed
+            normals[0, :, 0] = 1
+            corner_y = np.random.choice([0, height])  # Top or bottom right corner
+            normals[width, corner_y, 1] = 1
+            
+            # Force at random location on left edge
+            force_y = np.random.randint(0, height + 1)
+            forces[0, force_y, 1] = -1
+        else:
+            # Right edge fixed
+            normals[width, :, 0] = 1
+            corner_y = np.random.choice([0, height])  # Top or bottom left corner
+            normals[0, corner_y, 1] = 1
+            
+            # Force at random location on right edge
+            force_y = np.random.randint(0, height + 1)
+            forces[width, force_y, 1] = -1
+    
+    return normals, forces, density
+
+
 class BeamOptimizationEnv(gym.Env):
     metadata = {'render.modes': ['human']}  
     
     def __init__(self, width=4, height=4, density=0.4, step_size=0.5, 
-                 optimal_density=0.5, reward_weights=None, beam_type=1):
+                 optimal_density=0.5, reward_weights=None, beam_type=1,
+                 custom_normals=None, custom_forces=None, use_random_beam=False):
+        """
+        Initialize the beam optimization environment.
+        
+        Args:
+            width, height: Grid dimensions
+            density: Target volume fraction
+            beam_type: Predefined beam type (1-9), used if custom_normals/forces not provided
+            custom_normals: Optional custom boundary conditions (normals array)
+            custom_forces: Optional custom forces array
+            use_random_beam: If True, generate a new random beam on each reset()
+        """
         super(BeamOptimizationEnv, self).__init__()
         # Environments run on CPU; only the PPO model uses GPU for batched inference
         self.device = 'cpu'
@@ -36,11 +121,12 @@ class BeamOptimizationEnv(gym.Env):
         
         self.best_compliance = torch.full((10,), float('inf'), dtype=torch.float32, device=self.device)
         self.beam_type = beam_type
+        self.use_random_beam = use_random_beam
         self.phase_threshold_1 = 0.05
         self.phase_threshold_2 = 0.1
 
-        # Initialize beam properties
-        beam_functions = {
+        # Store beam functions for reference
+        self.beam_functions = {
             1: fem.mbb_beam_1,
             2: fem.mbb_beam_2,
             3: fem.mbb_beam_3,
@@ -52,7 +138,18 @@ class BeamOptimizationEnv(gym.Env):
             9: fem.mbb_beam_9
         }
 
-        normals, forces, _ = beam_functions[beam_type](width, height, density)
+        # Initialize beam properties based on input mode
+        if custom_normals is not None and custom_forces is not None:
+            # Use custom normals/forces
+            normals = custom_normals
+            forces = custom_forces
+        elif use_random_beam:
+            # Generate random beam (will be regenerated on each reset)
+            normals, forces, _ = generate_random_beam(width, height, density)
+        else:
+            # Use predefined beam type
+            normals, forces, _ = self.beam_functions[beam_type](width, height, density)
+        
         self.normals = torch.tensor(normals, dtype=torch.float32, device=self.device)
         self.forces = torch.tensor(forces, dtype=torch.float32, device=self.device)
         self.args = fem.get_args(self.normals.cpu().numpy(), self.forces.cpu().numpy(), density)
@@ -82,15 +179,16 @@ class BeamOptimizationEnv(gym.Env):
             3: self.compute_weight_matrix(size=3)
         }
 
-        # Only compute base_compliance for the beam type being used (9x faster startup)
-        self.base_compliance = {
-            self.beam_type: fem.optim(
-                fem.get_args(*beam_functions[self.beam_type](width, height, density)), 
-                x=None
-            )[0]
-        }
+        # Compute base_compliance for normalization
+        self._compute_base_compliance()
 
         self.reset()
+    
+    def _compute_base_compliance(self):
+        """Compute the base compliance for the current beam configuration."""
+        # Use the current normals/forces to compute base compliance
+        base_c, _ = fem.optim(self.args, x=None)
+        self.base_compliance = {self.beam_type: base_c}
 
     def construct_cnn_state(self, densities, normals, forces):
         """
@@ -129,6 +227,15 @@ class BeamOptimizationEnv(gym.Env):
         if seed is not None:
             np.random.seed(seed)
             torch.manual_seed(seed)
+        
+        # If using random beams, generate a new beam configuration each episode
+        if self.use_random_beam:
+            normals, forces, _ = generate_random_beam(self.width, self.height, self.density)
+            self.normals = torch.tensor(normals, dtype=torch.float32, device=self.device)
+            self.forces = torch.tensor(forces, dtype=torch.float32, device=self.device)
+            self.args = fem.get_args(self.normals.cpu().numpy(), self.forces.cpu().numpy(), self.density)
+            # Recompute base compliance for the new beam
+            self._compute_base_compliance()
         
         # Initialize densities as a 2D tensor: [width, height]
         densities = torch.ones((self.width, self.height), dtype=torch.float32, device=self.device) * self.optimal_density

@@ -162,12 +162,170 @@ class CNNActorCritic(nn.Module):
         return action_logprobs, state_values, dist_entropy
 
 
+class TwoPathActorCritic(nn.Module):
+    """
+    Two-path CNN architecture with separate encoders for:
+    - Path 1: Density channel (1 channel) - the changing state
+    - Path 2: Boundary conditions (4 channels) - forces and normals (static per episode)
+    
+    This forces the network to explicitly encode boundary condition information
+    rather than ignoring it in favor of the more dynamic density channel.
+    """
+    def __init__(self, num_actions, width, height, has_continuous_action_space, action_std_init, dropout_rate=0.1):
+        super(TwoPathActorCritic, self).__init__()
+        self.has_continuous_action_space = has_continuous_action_space
+        self.width = width
+        self.height = height
+
+        # ============ Path 1: Density Encoder (1 channel) ============
+        self.density_encoder = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+        )
+        
+        # ============ Path 2: Boundary Condition Encoder (4 channels: normals_x, normals_y, forces_x, forces_y) ============
+        self.bc_encoder = nn.Sequential(
+            nn.Conv2d(4, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+        )
+        
+        # ============ Fusion Layer ============
+        # Combine features from both paths
+        self.fusion_conv = nn.Sequential(
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),  # 64 + 64 = 128
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+        )
+        
+        # Flatten dimension after fusion
+        self.flatten_dim = 128 * width * height
+        
+        # ============ Actor Head ============
+        self.fc_actor = nn.Sequential(
+            nn.Linear(self.flatten_dim, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(256, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(256, num_actions),
+            nn.Tanh() if has_continuous_action_space else nn.Softmax(dim=-1)
+        )
+        
+        # ============ Critic Head ============
+        self.fc_critic = nn.Sequential(
+            nn.Linear(self.flatten_dim, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(256, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(256, 1)
+        )
+        
+        # Initialize weights
+        self.apply(self.weights_init_)
+        
+        # For continuous action space
+        if self.has_continuous_action_space:
+            self.action_var = torch.full((num_actions,), action_std_init ** 2).to(device)
+    
+    def weights_init_(self, m):
+        if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
+            torch.nn.init.kaiming_uniform_(m.weight, a=0, mode='fan_in', nonlinearity='relu')
+            if m.bias is not None:
+                torch.nn.init.constant_(m.bias, 0)
+    
+    def forward_features(self, states):
+        """Extract features from both paths and fuse them."""
+        # Split state into density and boundary conditions
+        density = states[:, 0:1, :, :]   # Channel 0: densities
+        bc = states[:, 1:5, :, :]        # Channels 1-4: normals_x, normals_y, forces_x, forces_y
+        
+        # Encode each path separately
+        feat_density = self.density_encoder(density)   # [batch, 64, W, H]
+        feat_bc = self.bc_encoder(bc)                  # [batch, 64, W, H]
+        
+        # Concatenate and fuse
+        fused = torch.cat([feat_density, feat_bc], dim=1)  # [batch, 128, W, H]
+        fused = self.fusion_conv(fused)                     # [batch, 128, W, H]
+        
+        # Flatten
+        return fused.view(fused.size(0), -1)  # [batch, 128*W*H]
+    
+    def act(self, states):
+        """Given states, select actions, log probabilities, and state values."""
+        x = self.forward_features(states)
+        
+        # Actor
+        action_probs = self.fc_actor(x)
+        if self.has_continuous_action_space:
+            action_mean = action_probs
+            action_var = self.action_var.expand_as(action_mean)
+            cov_mat = torch.diag_embed(action_var)
+            dist = MultivariateNormal(action_mean, cov_mat)
+            actions = dist.sample()
+            action_logprobs = dist.log_prob(actions)
+        else:
+            dist = Categorical(action_probs)
+            actions = dist.sample()
+            action_logprobs = dist.log_prob(actions)
+        
+        # Critic
+        state_values = self.fc_critic(x).squeeze(-1)
+        
+        return actions, action_logprobs, state_values
+    
+    def evaluate(self, states, actions):
+        """Given states and actions, evaluate log probabilities, state values, and entropy."""
+        x = self.forward_features(states)
+        
+        # Actor
+        action_probs = self.fc_actor(x)
+        if self.has_continuous_action_space:
+            action_mean = action_probs
+            action_var = self.action_var.expand_as(action_mean)
+            cov_mat = torch.diag_embed(action_var)
+            dist = MultivariateNormal(action_mean, cov_mat)
+            action_logprobs = dist.log_prob(actions)
+            dist_entropy = dist.entropy()
+        else:
+            dist = Categorical(action_probs)
+            action_logprobs = dist.log_prob(actions)
+            dist_entropy = dist.entropy()
+        
+        # Critic
+        state_values = self.fc_critic(x).squeeze(-1)
+        
+        return action_logprobs, state_values, dist_entropy
+
+
 class PPO:
     def __init__(self, state_channels, width, height, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip,
-                 has_continuous_action_space, action_std_init=0.6, gae_lambda=0.95, num_envs=1, device=device):
+                 has_continuous_action_space, action_std_init=0.6, gae_lambda=0.95, num_envs=1, device=device,
+                 use_two_path=False):
         
         self.has_continuous_action_space = has_continuous_action_space
         self.num_envs = num_envs
+        self.use_two_path = use_two_path
 
         self.gamma = gamma
         self.gae_lambda = gae_lambda  
@@ -187,38 +345,67 @@ class PPO:
             buffer_device='cpu'
         )
 
-        # Initialize ActorCritic
-        self.policy = CNNActorCritic(
-            num_channels=state_channels, 
-            num_actions=action_dim, 
-            width=width, 
-            height=height, 
-            has_continuous_action_space=has_continuous_action_space, 
-            action_std_init=action_std_init
-        ).to(device)
-        
-        self.optimizer = optim.Adam([
-            {'params': self.policy.conv1.parameters(), 'lr': lr_actor},
-            {'params': self.policy.bn1.parameters(), 'lr': lr_actor},
-            {'params': self.policy.conv2.parameters(), 'lr': lr_actor},
-            {'params': self.policy.bn2.parameters(), 'lr': lr_actor},
-            {'params': self.policy.conv3.parameters(), 'lr': lr_actor},
-            {'params': self.policy.bn3.parameters(), 'lr': lr_actor},
-            {'params': self.policy.fc_actor.parameters(), 'lr': lr_actor},
-            {'params': self.policy.fc_critic.parameters(), 'lr': lr_critic}
-        ])
+        # Initialize ActorCritic - choose architecture based on use_two_path flag
+        if use_two_path:
+            print("Using TwoPathActorCritic (force encoder architecture)")
+            self.policy = TwoPathActorCritic(
+                num_actions=action_dim, 
+                width=width, 
+                height=height, 
+                has_continuous_action_space=has_continuous_action_space, 
+                action_std_init=action_std_init
+            ).to(device)
+            
+            # Optimizer for two-path architecture
+            self.optimizer = optim.Adam([
+                {'params': self.policy.density_encoder.parameters(), 'lr': lr_actor},
+                {'params': self.policy.bc_encoder.parameters(), 'lr': lr_actor},
+                {'params': self.policy.fusion_conv.parameters(), 'lr': lr_actor},
+                {'params': self.policy.fc_actor.parameters(), 'lr': lr_actor},
+                {'params': self.policy.fc_critic.parameters(), 'lr': lr_critic}
+            ])
+            
+            # Copy policy for old policy
+            self.policy_old = TwoPathActorCritic(
+                num_actions=action_dim, 
+                width=width, 
+                height=height, 
+                has_continuous_action_space=has_continuous_action_space, 
+                action_std_init=action_std_init
+            ).to(device)
+        else:
+            print("Using CNNActorCritic (single-path architecture)")
+            self.policy = CNNActorCritic(
+                num_channels=state_channels, 
+                num_actions=action_dim, 
+                width=width, 
+                height=height, 
+                has_continuous_action_space=has_continuous_action_space, 
+                action_std_init=action_std_init
+            ).to(device)
+            
+            self.optimizer = optim.Adam([
+                {'params': self.policy.conv1.parameters(), 'lr': lr_actor},
+                {'params': self.policy.bn1.parameters(), 'lr': lr_actor},
+                {'params': self.policy.conv2.parameters(), 'lr': lr_actor},
+                {'params': self.policy.bn2.parameters(), 'lr': lr_actor},
+                {'params': self.policy.conv3.parameters(), 'lr': lr_actor},
+                {'params': self.policy.bn3.parameters(), 'lr': lr_actor},
+                {'params': self.policy.fc_actor.parameters(), 'lr': lr_actor},
+                {'params': self.policy.fc_critic.parameters(), 'lr': lr_critic}
+            ])
+            
+            # Copy policy for old policy
+            self.policy_old = CNNActorCritic(
+                num_channels=state_channels, 
+                num_actions=action_dim, 
+                width=width, 
+                height=height, 
+                has_continuous_action_space=has_continuous_action_space, 
+                action_std_init=action_std_init
+            ).to(device)
 
         self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=1000, gamma=0.95)
-
-        # Copy policy for old policy
-        self.policy_old = CNNActorCritic(
-            num_channels=state_channels, 
-            num_actions=action_dim, 
-            width=width, 
-            height=height, 
-            has_continuous_action_space=has_continuous_action_space, 
-            action_std_init=action_std_init
-        ).to(device)
         self.policy_old.load_state_dict(self.policy.state_dict())
         
         self.MseLoss = nn.MSELoss()
