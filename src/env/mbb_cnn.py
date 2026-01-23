@@ -103,10 +103,10 @@ class BeamOptimizationEnv(gym.Env):
         self.width = width
         self.height = height
         self.density = density
-        self.step_size_initial = 1.0
+        self.step_size_initial = 0.5
         self.step_size_final = 0.05
         self.optimal_density = optimal_density  
-        self.max_steps = self.width * self.height * 2
+        self.max_steps = self.width * self.height * 3
         self.action_space = gym.spaces.Discrete(2 * self.width * self.height)
         
         # Determine number of edges based on beam structure
@@ -335,7 +335,7 @@ class BeamOptimizationEnv(gym.Env):
         grey_mask = (densities > 0.2) & (densities < 0.8)
         fraction_grey = np.mean(grey_mask)  # Fraction of cells that are "grey"
         
-        r_grey = -1 * fraction_grey
+        r_grey = -0.1 * fraction_grey  # Reduced to prioritize compliance
         
         # Density low reward
         density_low_reward = np.mean((0.5 - densities) ** 2)
@@ -472,7 +472,7 @@ class BeamOptimizationEnv(gym.Env):
             # If diff > 0 => compliance improved
             # If diff < 0 => got worse
             # Scale it so we don't overshadow main_reward
-            improvement_scale = 0.05  # or tweak as needed
+            improvement_scale = 0.5  # Stronger signal for fine-tuning near optimum
             reward_improvement = improvement_scale * diff / self.base_compliance[self.beam_type]
         else:
             reward_improvement = 0.0
@@ -481,7 +481,7 @@ class BeamOptimizationEnv(gym.Env):
         reward = reward_action + main_reward + reward_improvement
 
         # Optionally, do mild scaling or clipping
-        reward = reward / (1 + abs(reward))  # np.clip(reward, -5.0, 5.0)
+        reward = np.clip(reward, -10.0, 10.0)  # Linear clipping instead of squashing
 
         if self.current_compliance < self.best_compliance[self.beam_type]:
             self.best_compliance[self.beam_type] = self.current_compliance

@@ -520,7 +520,7 @@ class PPO:
                 loss_critic = self.MseLoss(state_values_new, returns).mean()
                 loss_entropy = -dist_entropy.mean()
 
-                loss = 2 * loss_actor + loss_critic + 0.1 * loss_entropy
+                loss = loss_actor + loss_critic + 0.1 * loss_entropy
 
             self.optimizer.zero_grad()
             if self.scaler:
