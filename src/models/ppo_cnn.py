@@ -236,7 +236,7 @@ class TwoPathActorCritic(nn.Module):
     This forces the network to explicitly encode boundary condition information
     rather than ignoring it in favor of the more dynamic density channel.
     """
-    def __init__(self, num_actions, width, height, has_continuous_action_space, action_std_init, dropout_rate=0.1, use_attention=True):
+    def __init__(self, num_actions, width, height, has_continuous_action_space, action_std_init, dropout_rate=0.1, use_attention=False):
         super(TwoPathActorCritic, self).__init__()
         self.has_continuous_action_space = has_continuous_action_space
         self.width = width
