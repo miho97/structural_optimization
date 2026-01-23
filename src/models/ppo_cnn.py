@@ -236,11 +236,12 @@ class TwoPathActorCritic(nn.Module):
     This forces the network to explicitly encode boundary condition information
     rather than ignoring it in favor of the more dynamic density channel.
     """
-    def __init__(self, num_actions, width, height, has_continuous_action_space, action_std_init, dropout_rate=0.1):
+    def __init__(self, num_actions, width, height, has_continuous_action_space, action_std_init, dropout_rate=0.1, use_attention=True):
         super(TwoPathActorCritic, self).__init__()
         self.has_continuous_action_space = has_continuous_action_space
         self.width = width
         self.height = height
+        self.use_attention = use_attention
 
         # ============ Path 1: Density Encoder (1 channel) ============
         self.density_encoder = nn.Sequential(
@@ -324,7 +325,7 @@ class TwoPathActorCritic(nn.Module):
                 torch.nn.init.constant_(m.bias, 0)
     
     def forward_features(self, states):
-        """Extract features from both paths, fuse them, and apply spatial attention."""
+        """Extract features from both paths, fuse them, and optionally apply spatial attention."""
         # Split state into density and boundary conditions
         density = states[:, 0:1, :, :]   # Channel 0: densities
         bc = states[:, 1:5, :, :]        # Channels 1-4: normals_x, normals_y, forces_x, forces_y
@@ -338,7 +339,10 @@ class TwoPathActorCritic(nn.Module):
         fused = self.fusion_conv(fused)                     # [batch, 128, W, H]
         
         # Apply spatial attention for global reasoning (load paths)
-        fused = self.spatial_attention(fused)               # [batch, 128, W, H]
+        # Run in float32 to avoid mixed precision issues
+        if self.use_attention:
+            with torch.cuda.amp.autocast(enabled=False):
+                fused = self.spatial_attention(fused.float())
         
         # Flatten
         return fused.view(fused.size(0), -1)  # [batch, 128*W*H]
