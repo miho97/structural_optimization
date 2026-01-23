@@ -162,11 +162,50 @@ class CNNActorCritic(nn.Module):
         return action_logprobs, state_values, dist_entropy
 
 
+class SpatialAttention(nn.Module):
+    """
+    Self-attention over spatial locations.
+    Allows each grid cell to attend to all other cells, enabling the network
+    to reason about global structure (e.g., load paths from force to support).
+    """
+    def __init__(self, channels, num_heads=4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        self.scale = self.head_dim ** -0.5
+        
+        # Single projection for Q, K, V
+        self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1, bias=False)
+        self.proj = nn.Conv2d(channels, channels, kernel_size=1)
+        
+    def forward(self, x):
+        B, C, H, W = x.shape
+        
+        # Compute Q, K, V: [B, 3*C, H, W] -> [B, 3, num_heads, head_dim, H*W]
+        qkv = self.qkv(x).reshape(B, 3, self.num_heads, self.head_dim, H * W)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]  # Each: [B, num_heads, head_dim, H*W]
+        
+        # Attention: [B, num_heads, H*W, H*W]
+        attn = (q.transpose(-2, -1) @ k) * self.scale
+        attn = torch.softmax(attn, dim=-1)
+        
+        # Apply attention to values: [B, num_heads, head_dim, H*W]
+        out = v @ attn.transpose(-2, -1)
+        out = out.reshape(B, C, H, W)
+        out = self.proj(out)
+        
+        # Residual connection
+        return x + out
+
+
 class TwoPathActorCritic(nn.Module):
     """
     Two-path CNN architecture with separate encoders for:
     - Path 1: Density channel (1 channel) - the changing state
     - Path 2: Boundary conditions (4 channels) - forces and normals (static per episode)
+    
+    Features spatial self-attention after fusion to reason about global structure
+    (load paths from forces to supports).
     
     This forces the network to explicitly encode boundary condition information
     rather than ignoring it in favor of the more dynamic density channel.
@@ -210,6 +249,10 @@ class TwoPathActorCritic(nn.Module):
             nn.BatchNorm2d(128),
             nn.ReLU(),
         )
+        
+        # ============ Spatial Attention ============
+        # Self-attention over spatial locations for global reasoning
+        self.spatial_attention = SpatialAttention(channels=128, num_heads=4)
         
         # Flatten dimension after fusion
         self.flatten_dim = 128 * width * height
@@ -255,7 +298,7 @@ class TwoPathActorCritic(nn.Module):
                 torch.nn.init.constant_(m.bias, 0)
     
     def forward_features(self, states):
-        """Extract features from both paths and fuse them."""
+        """Extract features from both paths, fuse them, and apply spatial attention."""
         # Split state into density and boundary conditions
         density = states[:, 0:1, :, :]   # Channel 0: densities
         bc = states[:, 1:5, :, :]        # Channels 1-4: normals_x, normals_y, forces_x, forces_y
@@ -267,6 +310,9 @@ class TwoPathActorCritic(nn.Module):
         # Concatenate and fuse
         fused = torch.cat([feat_density, feat_bc], dim=1)  # [batch, 128, W, H]
         fused = self.fusion_conv(fused)                     # [batch, 128, W, H]
+        
+        # Apply spatial attention for global reasoning (load paths)
+        fused = self.spatial_attention(fused)               # [batch, 128, W, H]
         
         # Flatten
         return fused.view(fused.size(0), -1)  # [batch, 128*W*H]
