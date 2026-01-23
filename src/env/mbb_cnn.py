@@ -12,13 +12,10 @@ def generate_random_beam(width, height, density=0.4):
     """
     Generate a random but VALID beam configuration.
     
-    Uses one of six valid structural templates:
+    Uses one of three valid structural templates:
     - cantilever: One edge fully fixed, force on opposite side
     - simply_supported: Both ends supported, force on top
     - corner_supported: MBB-style with edge + corner support
-    - multi_load: Fixed edge with two forces at different heights
-    - propped_cantilever: Fixed edge + additional roller support
-    - horizontal_load: Fixed edge with horizontal force
     
     Returns:
         normals: np.ndarray of shape (width+1, height+1, 2)
@@ -28,11 +25,8 @@ def generate_random_beam(width, height, density=0.4):
     normals = np.zeros((width + 1, height + 1, 2))
     forces = np.zeros((width + 1, height + 1, 2))
     
-    # Pick a random valid template (6 templates total)
-    template = np.random.choice([
-        'cantilever', 'simply_supported', 'corner_supported',
-        'multi_load', 'propped_cantilever', 'horizontal_load'
-    ])
+    # Pick a random valid template (3 templates - proven to work)
+    template = np.random.choice(['cantilever', 'simply_supported', 'corner_supported'])
     
     if template == 'cantilever':
         # Fix one edge (left or right), force anywhere on opposite side
@@ -82,53 +76,6 @@ def generate_random_beam(width, height, density=0.4):
             # Force at random location on right edge
             force_y = np.random.randint(0, height + 1)
             forces[width, force_y, 1] = -1
-    
-    elif template == 'multi_load':
-        # Fixed edge with TWO forces at different heights
-        # Tests: distributing material to multiple load points
-        fixed_edge = np.random.choice(['left', 'right'])
-        if fixed_edge == 'left':
-            normals[0, :, 0] = 1  # Fix left edge in X
-            normals[0, 0, 1] = 1  # Pin bottom-left in Y
-            normals[0, height, 1] = 1  # Pin top-left in Y
-            force_x = width
-        else:
-            normals[width, :, 0] = 1  # Fix right edge in X
-            normals[width, 0, 1] = 1  # Pin bottom-right in Y
-            normals[width, height, 1] = 1  # Pin top-right in Y
-            force_x = 0
-        
-        # Two forces at different Y positions
-        y_positions = np.random.choice(range(height + 1), size=2, replace=False)
-        forces[force_x, y_positions[0], 1] = -0.5  # Half force each
-        forces[force_x, y_positions[1], 1] = -0.5
-    
-    elif template == 'propped_cantilever':
-        # Cantilever with additional roller support (statically indeterminate)
-        # Tests: redundant support handling
-        normals[0, :, 0] = 1  # Left edge fixed in X
-        normals[0, 0, 1] = 1  # Bottom-left pinned in Y
-        normals[0, height, 1] = 1  # Top-left pinned in Y
-        
-        # Additional roller support on right side (top or bottom corner)
-        support_y = np.random.choice([0, height])
-        normals[width, support_y, 1] = 1
-        
-        # Force somewhere in the middle-right region
-        force_x = np.random.randint(width // 2, width + 1)
-        force_y = np.random.randint(0, height + 1)
-        forces[force_x, force_y, 1] = -1
-    
-    elif template == 'horizontal_load':
-        # Fixed edge with HORIZONTAL force (completely different load direction)
-        # Tests: horizontal force handling (current blind spot)
-        normals[0, :, 0] = 1  # Left edge fixed in X
-        normals[0, 0, 1] = 1  # Pin Y at corners
-        normals[0, height, 1] = 1
-        
-        # Horizontal force pointing left (into the support)
-        force_y = np.random.randint(1, height)  # Not at corners to avoid singularity
-        forces[width, force_y, 0] = -1  # X-direction force!
     
     return normals, forces, density
 
