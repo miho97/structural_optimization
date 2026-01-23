@@ -174,27 +174,41 @@ class SpatialAttention(nn.Module):
         self.head_dim = channels // num_heads
         self.scale = self.head_dim ** -0.5
         
+        # Layer norm for numerical stability
+        self.norm = nn.LayerNorm(channels)
+        
         # Single projection for Q, K, V
-        self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1, bias=False)
-        self.proj = nn.Conv2d(channels, channels, kernel_size=1)
+        self.qkv = nn.Linear(channels, channels * 3, bias=False)
+        self.proj = nn.Linear(channels, channels)
+        
+        # Initialize with small weights for stability
+        nn.init.xavier_uniform_(self.qkv.weight, gain=0.1)
+        nn.init.xavier_uniform_(self.proj.weight, gain=0.1)
+        nn.init.zeros_(self.proj.bias)
         
     def forward(self, x):
         B, C, H, W = x.shape
         
-        # Compute Q, K, V: [B, 3*C, H, W] -> [B, 3, num_heads, head_dim, H*W]
-        qkv = self.qkv(x).reshape(B, 3, self.num_heads, self.head_dim, H * W)
-        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]  # Each: [B, num_heads, head_dim, H*W]
+        # Reshape to [B, H*W, C] for layer norm and attention
+        x_flat = x.permute(0, 2, 3, 1).reshape(B, H * W, C)
+        x_norm = self.norm(x_flat)
+        
+        # Compute Q, K, V: [B, H*W, 3*C]
+        qkv = self.qkv(x_norm).reshape(B, H * W, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, B, num_heads, H*W, head_dim]
+        q, k, v = qkv[0], qkv[1], qkv[2]  # Each: [B, num_heads, H*W, head_dim]
         
         # Attention: [B, num_heads, H*W, H*W]
-        attn = (q.transpose(-2, -1) @ k) * self.scale
+        attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = torch.softmax(attn, dim=-1)
         
-        # Apply attention to values: [B, num_heads, head_dim, H*W]
-        out = v @ attn.transpose(-2, -1)
-        out = out.reshape(B, C, H, W)
+        # Apply attention to values: [B, num_heads, H*W, head_dim]
+        out = attn @ v
+        out = out.transpose(1, 2).reshape(B, H * W, C)  # [B, H*W, C]
         out = self.proj(out)
         
-        # Residual connection
+        # Reshape back and residual connection
+        out = out.reshape(B, H, W, C).permute(0, 3, 1, 2)  # [B, C, H, W]
         return x + out
 
 
