@@ -167,49 +167,61 @@ class SpatialAttention(nn.Module):
     Self-attention over spatial locations.
     Allows each grid cell to attend to all other cells, enabling the network
     to reason about global structure (e.g., load paths from force to support).
+    
+    Uses gated residual connection (starts at 0) for training stability.
     """
     def __init__(self, channels, num_heads=4):
         super().__init__()
+        self.channels = channels
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
         self.scale = self.head_dim ** -0.5
         
-        # Layer norm for numerical stability
+        # Pre-norm for stability
         self.norm = nn.LayerNorm(channels)
         
-        # Single projection for Q, K, V
-        self.qkv = nn.Linear(channels, channels * 3, bias=False)
-        self.proj = nn.Linear(channels, channels)
+        # Q, K, V projections
+        self.to_q = nn.Linear(channels, channels, bias=False)
+        self.to_k = nn.Linear(channels, channels, bias=False)
+        self.to_v = nn.Linear(channels, channels, bias=False)
+        self.proj = nn.Linear(channels, channels, bias=False)
         
-        # Initialize with small weights for stability
-        nn.init.xavier_uniform_(self.qkv.weight, gain=0.1)
-        nn.init.xavier_uniform_(self.proj.weight, gain=0.1)
-        nn.init.zeros_(self.proj.bias)
+        # Learnable gate - starts at 0 so attention has no effect initially
+        self.gate = nn.Parameter(torch.zeros(1))
+        
+        # Initialize projections
+        for layer in [self.to_q, self.to_k, self.to_v, self.proj]:
+            nn.init.orthogonal_(layer.weight, gain=1.0)
         
     def forward(self, x):
         B, C, H, W = x.shape
+        N = H * W
         
-        # Reshape to [B, H*W, C] for layer norm and attention
-        x_flat = x.permute(0, 2, 3, 1).reshape(B, H * W, C)
+        # Reshape: [B, C, H, W] -> [B, N, C]
+        x_flat = x.flatten(2).transpose(1, 2)
         x_norm = self.norm(x_flat)
         
-        # Compute Q, K, V: [B, H*W, 3*C]
-        qkv = self.qkv(x_norm).reshape(B, H * W, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, B, num_heads, H*W, head_dim]
-        q, k, v = qkv[0], qkv[1], qkv[2]  # Each: [B, num_heads, H*W, head_dim]
+        # Compute Q, K, V separately
+        q = self.to_q(x_norm).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.to_k(x_norm).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.to_v(x_norm).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        # q, k, v: [B, num_heads, N, head_dim]
         
-        # Attention: [B, num_heads, H*W, H*W]
+        # Scaled dot-product attention
         attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn - attn.amax(dim=-1, keepdim=True).detach()  # Numerical stability
         attn = torch.softmax(attn, dim=-1)
         
-        # Apply attention to values: [B, num_heads, H*W, head_dim]
-        out = attn @ v
-        out = out.transpose(1, 2).reshape(B, H * W, C)  # [B, H*W, C]
+        # Apply attention
+        out = attn @ v  # [B, num_heads, N, head_dim]
+        out = out.transpose(1, 2).reshape(B, N, C)
         out = self.proj(out)
         
-        # Reshape back and residual connection
-        out = out.reshape(B, H, W, C).permute(0, 3, 1, 2)  # [B, C, H, W]
-        return x + out
+        # Reshape back: [B, N, C] -> [B, C, H, W]
+        out = out.transpose(1, 2).view(B, C, H, W)
+        
+        # Gated residual (gate starts at 0, learned during training)
+        return x + self.gate.tanh() * out
 
 
 class TwoPathActorCritic(nn.Module):
