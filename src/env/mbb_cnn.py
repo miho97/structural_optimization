@@ -335,7 +335,7 @@ class BeamOptimizationEnv(gym.Env):
         grey_mask = (densities > 0.2) & (densities < 0.8)
         fraction_grey = np.mean(grey_mask)  # Fraction of cells that are "grey"
         
-        r_grey = -1.0 * fraction_grey  # Increased to push for binary (0/1) structures
+        r_grey = -0.5 * fraction_grey  # Increased to push for binary (0/1) structures
         
         # Density low reward
         density_low_reward = np.mean((0.5 - densities) ** 2)
