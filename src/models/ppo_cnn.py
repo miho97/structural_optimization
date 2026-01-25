@@ -177,68 +177,68 @@ class TwoPathActorCritic(nn.Module):
         self.width = width
         self.height = height
 
-        # ============ Path 1: Density Encoder (1 channel) ============
+        # ============ Path 1: Density Encoder (1 channel) - WIDER ============
         self.density_encoder = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.Conv2d(1, 64, kernel_size=3, padding=1),      # Was 32
             nn.BatchNorm2d(64),
             nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),    # Was 64
+            nn.BatchNorm2d(128),
             nn.ReLU(),
-        )
-        
-        # ============ Path 2: Boundary Condition Encoder (4 channels: normals_x, normals_y, forces_x, forces_y) ============
-        self.bc_encoder = nn.Sequential(
-            nn.Conv2d(4, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-        )
-        
-        # ============ Fusion Layer ============
-        # Combine features from both paths
-        self.fusion_conv = nn.Sequential(
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),  # 64 + 64 = 128
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),   # Was 64
             nn.BatchNorm2d(128),
             nn.ReLU(),
         )
         
-        # Flatten dimension after fusion
-        self.flatten_dim = 128 * width * height
+        # ============ Path 2: Boundary Condition Encoder (4 channels) - WIDER ============
+        self.bc_encoder = nn.Sequential(
+            nn.Conv2d(4, 64, kernel_size=3, padding=1),      # Was 32
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),    # Was 64
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),   # Was 64
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+        )
         
-        # ============ Actor Head ============
+        # ============ Fusion Layer - WIDER ============
+        # Combine features from both paths
+        self.fusion_conv = nn.Sequential(
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),   # Was 128 → 128
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+        )
+        
+        # Flatten dimension after fusion - UPDATED
+        self.flatten_dim = 256 * width * height              # Was 128
+        
+        # ============ Actor Head - WIDER ============
         self.fc_actor = nn.Sequential(
-            nn.Linear(self.flatten_dim, 256),
-            nn.LayerNorm(256),
+            nn.Linear(self.flatten_dim, 512),                # Was 256
+            nn.LayerNorm(512),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
-            nn.Linear(256, 256),
-            nn.LayerNorm(256),
+            nn.Linear(512, 512),                             # Was 256
+            nn.LayerNorm(512),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
-            nn.Linear(256, num_actions),
+            nn.Linear(512, num_actions),
             nn.Tanh() if has_continuous_action_space else nn.Softmax(dim=-1)
         )
         
-        # ============ Critic Head ============
+        # ============ Critic Head - WIDER ============
         self.fc_critic = nn.Sequential(
-            nn.Linear(self.flatten_dim, 256),
-            nn.LayerNorm(256),
+            nn.Linear(self.flatten_dim, 512),                # Was 256
+            nn.LayerNorm(512),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
-            nn.Linear(256, 256),
-            nn.LayerNorm(256),
+            nn.Linear(512, 512),                             # Was 256
+            nn.LayerNorm(512),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
-            nn.Linear(256, 1)
+            nn.Linear(512, 1)
         )
         
         # Initialize weights
