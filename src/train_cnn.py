@@ -65,13 +65,19 @@ def evaluate_fixed_beams(agent, width, height, target_density, device):
         state, _ = env.reset(seed=10_000 + beam_type)
         total_reward = 0.0
         final_info = {}
+        selected_actions = set()
+        changed_actions = 0
         for _ in range(env.max_steps):
             state_tensor = torch.as_tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
             action, _, _ = agent.select_action(state_tensor, deterministic=True)
-            state, reward, terminated, truncated, final_info = env.step(int(action.item()))
+            selected_action = int(action.item())
+            selected_actions.add(selected_action)
+            state, reward, terminated, truncated, final_info = env.step(selected_action)
+            changed_actions += int(final_info["action_changed_density"])
             total_reward += reward
             if terminated or truncated:
                 break
+        density_field = env.density_field()
         results.append(
             {
                 "beam_type": beam_type,
@@ -79,7 +85,19 @@ def evaluate_fixed_beams(agent, width, height, target_density, device):
                 "compliance": final_info["compliance"],
                 "compliance_ratio": final_info["compliance_ratio"],
                 "volume_fraction": final_info["volume_fraction"],
+                "volume_deviation": final_info["volume_deviation"],
                 "volume_violation": final_info["volume_violation"],
+                "objective_cost": final_info["objective_cost"],
+                "changed_cells": int(
+                    np.count_nonzero(
+                        np.abs(density_field - target_density) > 1e-6
+                    )
+                ),
+                "unique_actions": len(selected_actions),
+                "no_op_actions": env.current_step - changed_actions,
+                "density_min": float(density_field.min()),
+                "density_max": float(density_field.max()),
+                "density_std": float(density_field.std()),
             }
         )
         env.close()
@@ -128,6 +146,7 @@ def train(config):
         minibatch_size=config.minibatch_size,
         value_coef=config.value_coef,
         entropy_coef=config.entropy_coef,
+        target_density=config.target_density,
     )
 
     log_path = next_available_path(
@@ -186,6 +205,11 @@ def train(config):
                 "mean_final_compliance",
                 "mean_final_compliance_ratio",
                 "mean_final_volume_fraction",
+                "mean_final_volume_deviation",
+                "mean_final_objective",
+                "mean_changed_action_fraction",
+                "mean_changed_cells",
+                "mean_density_std",
                 "updates",
                 "elapsed_seconds",
             ),
@@ -199,14 +223,24 @@ def train(config):
                 first_reset = False
                 states = torch.as_tensor(states_np, dtype=torch.float32, device=device)
                 episode_rewards = np.zeros(config.num_envs, dtype=np.float64)
+                episode_changed_actions = np.zeros(config.num_envs, dtype=np.int64)
                 final_infos = None
+                episode_steps = 0
 
-                for _ in range(config.width * config.height * 3):
+                for _ in range(config.width * config.height):
                     actions, logprobs, state_values = agent.select_action(states)
                     next_states_np, rewards, terminated, truncated, infos = vector_env.step(
                         actions.cpu().numpy()
                     )
                     done = np.logical_or(terminated, truncated)
+                    action_changed = np.asarray(
+                        infos.get(
+                            "action_changed_density",
+                            np.ones(config.num_envs, dtype=bool),
+                        )
+                    )
+                    episode_changed_actions += action_changed.astype(np.int64)
+                    episode_steps += 1
                     next_states = torch.as_tensor(
                         next_states_np, dtype=torch.float32, device=device
                     )
@@ -249,6 +283,18 @@ def train(config):
                 final_compliance = np.asarray(final_infos.get("compliance", np.nan))
                 final_ratio = np.asarray(final_infos.get("compliance_ratio", np.nan))
                 final_volume = np.asarray(final_infos.get("volume_fraction", np.nan))
+                final_volume_deviation = np.asarray(
+                    final_infos.get("volume_deviation", np.nan)
+                )
+                final_objective = np.asarray(
+                    final_infos.get("objective_cost", np.nan)
+                )
+                density_fields = (
+                    states[:, 0, : config.height, : config.width]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
                 row = {
                     "episodes": episodes,
                     "vector_steps": vector_steps,
@@ -257,6 +303,22 @@ def train(config):
                     "mean_final_compliance": float(np.nanmean(final_compliance)),
                     "mean_final_compliance_ratio": float(np.nanmean(final_ratio)),
                     "mean_final_volume_fraction": float(np.nanmean(final_volume)),
+                    "mean_final_volume_deviation": float(
+                        np.nanmean(final_volume_deviation)
+                    ),
+                    "mean_final_objective": float(np.nanmean(final_objective)),
+                    "mean_changed_action_fraction": float(
+                        episode_changed_actions.mean() / max(episode_steps, 1)
+                    ),
+                    "mean_changed_cells": float(
+                        np.count_nonzero(
+                            np.abs(density_fields - config.target_density) > 1e-6,
+                            axis=(1, 2),
+                        ).mean()
+                    ),
+                    "mean_density_std": float(
+                        density_fields.std(axis=(1, 2)).mean()
+                    ),
                     "updates": updates,
                     "elapsed_seconds": round(elapsed, 3),
                 }
@@ -266,7 +328,9 @@ def train(config):
                     f"episodes={episodes:,} step={vector_steps:,}/{config.timesteps:,} "
                     f"reward={row['mean_episode_reward']:.3f} "
                     f"C/C0={row['mean_final_compliance_ratio']:.3f} "
-                    f"volume={row['mean_final_volume_fraction']:.3f}"
+                    f"volume={row['mean_final_volume_fraction']:.3f} "
+                    f"changed={row['mean_changed_action_fraction']:.1%} "
+                    f"cells={row['mean_changed_cells']:.1f}"
                 )
         finally:
             vector_env.close()
@@ -293,7 +357,9 @@ def train(config):
             print(
                 f"  beam={result['beam_type']} C={result['compliance']:.4f} "
                 f"C/C0={result['compliance_ratio']:.4f} "
-                f"volume={result['volume_fraction']:.4f}"
+                f"volume={result['volume_fraction']:.4f} "
+                f"cells={result['changed_cells']} unique={result['unique_actions']} "
+                f"no_op={result['no_op_actions']}"
             )
         print(f"Evaluation: {evaluation_path}")
     return checkpoint_path, log_path

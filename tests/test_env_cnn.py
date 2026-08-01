@@ -90,7 +90,77 @@ class BeamOptimizationEnvironmentTests(unittest.TestCase):
             _, info = env.calculate_reward()
             penalties.append(info["r_mass"])
             self.assertAlmostEqual(info["volume_violation"], 0.1, places=6)
+            self.assertAlmostEqual(info["volume_error"], 0.1, places=6)
         self.assertAlmostEqual(penalties[0], penalties[1], places=6)
+
+    def test_volume_penalty_is_symmetric_and_prevents_empty_collapse(self):
+        env = BeamOptimizationEnv(6, 6, density=0.4, beam_type=1)
+        baseline_score, _ = env.calculate_reward()
+
+        env.state[0, :6, :6] = 0.36
+        under_score, under_info = env.calculate_reward()
+        env.state[0, :6, :6] = 0.44
+        _, over_info = env.calculate_reward()
+        self.assertAlmostEqual(under_info["volume_error"], -0.1, places=6)
+        self.assertAlmostEqual(over_info["volume_error"], 0.1, places=6)
+        self.assertAlmostEqual(under_info["r_mass"], over_info["r_mass"], places=6)
+
+        env.state[0, :6, :6] = env.minimum_density
+        empty_score, empty_info = env.calculate_reward()
+        self.assertLess(empty_score, baseline_score)
+        self.assertLess(empty_score, under_score)
+        self.assertGreater(empty_info["volume_deviation"], 0.99)
+
+    def test_step_reward_is_objective_improvement_without_edit_bonus(self):
+        env = BeamOptimizationEnv(4, 3, density=0.4, beam_type=1)
+        objective_before = env.current_objective
+        _, reward, _, _, info = env.step(0)
+        self.assertAlmostEqual(info["objective_before"], objective_before, places=8)
+        self.assertAlmostEqual(
+            info["reward_main"],
+            info["objective_before"] - info["objective_after"],
+            places=8,
+        )
+        self.assertEqual(info["reward_action"], 0.0)
+        self.assertAlmostEqual(reward, info["reward_main"], places=8)
+
+    def test_saturated_edits_are_exposed_as_invalid_actions(self):
+        env = BeamOptimizationEnv(3, 2, density=0.4, beam_type=1)
+        total_cells = env.width * env.height
+        _, _, _, _, first_info = env.step(0)
+        self.assertTrue(first_info["action_changed_density"])
+        mask = env.valid_action_mask()
+        self.assertFalse(bool(mask[0]))
+        self.assertFalse(bool(mask[total_cells]))
+
+        _, _, _, _, repeated_info = env.step(0)
+        self.assertFalse(repeated_info["action_changed_density"])
+        self.assertFalse(repeated_info["action_was_valid"])
+        self.assertEqual(repeated_info["reward_action"], -0.05)
+
+    def test_completed_episode_enforces_the_material_budget(self):
+        env = BeamOptimizationEnv(6, 6, density=0.4, beam_type=1)
+        selected_cells = set()
+        final_info = None
+        for step in range(env.width * env.height):
+            valid_actions = np.flatnonzero(env.valid_action_mask())
+            self.assertGreater(valid_actions.size, 0)
+            # Prefer solid assignments to stress the upper-budget guard.
+            action = int(valid_actions[-1])
+            selected_cells.add(action % (env.width * env.height))
+            _, _, terminated, _, final_info = env.step(action)
+            self.assertEqual(terminated, step == env.width * env.height - 1)
+
+        self.assertEqual(len(selected_cells), env.width * env.height)
+        self.assertEqual(final_info["solid_cells"], env.solid_cell_budget)
+        self.assertEqual(final_info["undecided_cells"], 0)
+        self.assertEqual(np.count_nonzero(env.valid_action_mask()), 0)
+        expected_volume = (
+            env.solid_cell_budget * env.maximum_density
+            + (env.width * env.height - env.solid_cell_budget)
+            * env.minimum_density
+        ) / (env.width * env.height)
+        self.assertAlmostEqual(final_info["volume_fraction"], expected_volume, places=7)
 
     def test_baseline_compliance_reward_is_zero_and_decade_scaled(self):
         env = BeamOptimizationEnv(4, 3, density=0.4, beam_type=1)

@@ -50,15 +50,19 @@ point.
 - The density argument is the authoritative target volume fraction unless the
   legacy `optimal_density` override is explicitly supplied.
 
-Volume violation is measured as a relative fraction and receives a default
-weight of five, so feasibility remains important without scaling with the
-number of cells.
+The optimized cost is dimensionless: log compliance ratio plus a symmetric,
+squared relative-volume error and a small binary-density tie-breaker. Step
+reward is the reduction in that cost, not a recurring bonus for an extreme
+density. Empty and overfilled designs are therefore both worse than a feasible
+design, with the same interpretation at every grid resolution.
 
-The actor emits two spatial logits per physical cell (decrease and increase),
-so padded nodal pixels can never be selected. A dilated residual context stack
-provides a receptive field larger than 50x50, allowing actions to depend on
-distant loads and supports. The critic uses global pooling; model parameter
-count is independent of grid resolution.
+The actor emits two spatial logits per physical cell (void and solid), so
+padded nodal pixels can never be selected. Each cell is assigned exactly once;
+both of its actions are then masked. This removes no-op/reversal loops and
+makes an episode exactly one meaningful decision per element. A dilated
+residual context stack provides a receptive field larger than 50x50, allowing
+actions to depend on distant loads and supports. The critic uses global
+pooling; model parameter count is independent of grid resolution.
 
 ## Tests
 
@@ -69,8 +73,9 @@ The tests use Python's standard-library runner and require no pytest install:
 ```
 
 They cover rectangular action mapping, node/image alignment, seeded resets,
-volume-penalty invariance, FEM energy consistency and gradients, constant model
-size through 50x50, bootstrapped GAE, minibatched updates, and checkpoints.
+symmetric anti-collapse volume costs, invalid-action masking, FEM energy
+consistency and gradients, constant model size through 50x50, bootstrapped GAE,
+minibatched updates, and checkpoints.
 
 ## Scaling notes
 

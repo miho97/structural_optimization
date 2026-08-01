@@ -41,6 +41,7 @@ class FullyConvolutionalPolicyTests(unittest.TestCase):
             action_std_init=0.6,
         )
         states = torch.zeros(5, 5, 4, 3)
+        states[:, 0, :3, :2] = 0.4
         features = model.forward_features(states)
         logits = model.action_output(features)
         self.assertEqual(logits.shape, (5, 12))
@@ -48,6 +49,45 @@ class FullyConvolutionalPolicyTests(unittest.TestCase):
         self.assertEqual(actions.shape, (5,))
         self.assertEqual(logprobs.shape, (5,))
         self.assertEqual(values.shape, (5,))
+
+    def test_policy_assigns_zero_probability_to_saturated_edits(self):
+        model = TwoPathActorCritic(
+            num_actions=12,
+            width=4,
+            height=3,
+            has_continuous_action_space=False,
+            action_std_init=0.6,
+        )
+        states = torch.zeros(1, 5, 4, 3)
+        states[:, 0, :3, :2] = 0.4
+        states[:, 0, 0, 0] = 0.001  # cell 0 was assigned void
+        states[:, 0, 0, 1] = 1.0  # cell 1 was assigned solid
+        logits = torch.zeros(1, 12)
+        logits[0, 0] = 100.0
+        logits[0, 7] = 100.0
+
+        distribution = model.distribution(logits, states)
+        self.assertEqual(float(distribution.probs[0, 0]), 0.0)
+        self.assertEqual(float(distribution.probs[0, 1]), 0.0)
+        self.assertEqual(float(distribution.probs[0, 6]), 0.0)
+        self.assertEqual(float(distribution.probs[0, 7]), 0.0)
+        samples = distribution.sample((256,))
+        self.assertFalse(bool((samples == 0).any()))
+        self.assertFalse(bool((samples == 7).any()))
+
+        deterministic_action, _, _ = model.act(states, deterministic=True)
+        mask = model.valid_action_mask(states)
+        self.assertTrue(bool(mask[0, deterministic_action.item()]))
+
+        budget_filled = states.clone()
+        budget_filled[:, 0, 1, 0] = 1.0
+        solid_logits = torch.zeros(1, 12)
+        solid_logits[:, 6:] = 100.0
+        budget_distribution = model.distribution(solid_logits, budget_filled)
+        self.assertEqual(float(budget_distribution.probs[:, 6:].sum()), 0.0)
+        self.assertAlmostEqual(
+            float(budget_distribution.probs[:, :6].sum()), 1.0, places=6
+        )
 
 
 class PPOCorrectnessTests(unittest.TestCase):

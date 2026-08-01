@@ -70,6 +70,8 @@ class BeamOptimizationEnv(gym.Env):
     """Sequential density-editing environment backed by sparse FEM."""
 
     metadata = {"render_modes": ["human"]}
+    minimum_density = 0.001
+    maximum_density = 1.0
 
     def __init__(
         self,
@@ -101,15 +103,21 @@ class BeamOptimizationEnv(gym.Env):
         # ``optimal_density`` is kept for compatibility. There is one
         # authoritative volume target internally.
         self.target_density = float(density if optimal_density is None else optimal_density)
-        if not 0 < self.target_density <= 1:
-            raise ValueError("optimal_density must be in (0, 1]")
+        if not self.minimum_density < self.target_density < self.maximum_density:
+            raise ValueError(
+                "target density must lie strictly between the void and solid bounds"
+            )
         self.density = self.target_density
         self.optimal_density = self.target_density
+        # Kept as an accepted legacy argument. Actions now make an explicit
+        # void/solid assignment, so their effect is independent of ordering.
         self.step_size_initial = float(step_size)
-        self.step_size_final = min(0.05, self.step_size_initial)
-        self.max_steps = int(max_steps or self.width * self.height * 3)
-        if self.max_steps < 1:
-            raise ValueError("max_steps must be positive")
+        total_cells = self.width * self.height
+        if max_steps is not None and int(max_steps) < total_cells:
+            raise ValueError("max_steps must allow one assignment per physical cell")
+        # Longer legacy horizons cannot add useful work after every cell has
+        # been assigned, so the effective horizon is exactly the cell count.
+        self.max_steps = total_cells
 
         self.action_space = gym.spaces.Discrete(2 * self.width * self.height)
         observation_shape = (5, self.height + 1, self.width + 1)
@@ -139,13 +147,15 @@ class BeamOptimizationEnv(gym.Env):
 
         weights = reward_weights or {}
         self.w_compliance = float(weights.get("w_compliance", 1.0))
-        self.w_density_low = float(weights.get("w_density_low", 1.0))
-        # The violation is a relative fraction rather than a cell count. A
-        # weight of five makes feasibility dominant without changing meaning
-        # as grid resolution changes.
+        # Compliance minimization with a prescribed material fraction uses
+        # the full available volume at its optimum. A symmetric, squared
+        # relative error makes that equality explicit and, critically, does
+        # not make deleting material cheaper than adding it.
         self.w_total_mass = float(weights.get("w_total_mass", 5.0))
-        self.w_grey = float(weights.get("w_grey", 0.5))
-        self.improvement_scale = float(weights.get("w_improvement", 0.5))
+        # SIMP already discourages intermediate densities. This small term is
+        # only a tie-breaker; the old dense extremeness/grey rewards could
+        # dominate compliance and pay the policy to empty the grid.
+        self.w_binary = float(weights.get("w_binary", 0.05))
 
         if custom_normals is not None:
             normals, forces = custom_normals, custom_forces
@@ -241,18 +251,56 @@ class BeamOptimizationEnv(gym.Env):
         self.best_compliance_ratio = self.current_compliance / self.base_compliance_value
         self.reward = 0.0
         self.state = self.construct_cnn_state(densities)
-        info = {
-            "compliance": self.current_compliance,
-            "base_compliance": self.base_compliance_value,
-            "compliance_ratio": self.best_compliance_ratio,
-            "volume_fraction": self.current_constraint,
-            "target_volume_fraction": self.target_density,
-        }
+        _, info = self._objective_terms(
+            densities.numpy(), self.current_compliance, self.current_constraint
+        )
+        self.previous_objective = info["objective_cost"]
+        self.current_objective = self.previous_objective
+        self.best_objective = self.current_objective
         return self.state.numpy().copy(), info
 
     def density_field(self):
         """Return a copy of the physical ``(height, width)`` density field."""
         return self.state[0, : self.height, : self.width].numpy().copy()
+
+    def valid_action_mask(self):
+        """Return undecided void/solid assignments in categorical order.
+
+        A cell starts at the target density and is assigned exactly once to a
+        density bound. Masking both directions afterward makes the episode
+        acyclic and prevents deterministic policies from editing one cell in
+        a loop while the rest of the structure stays untouched.
+        """
+        densities = self.density_field().reshape(-1)
+        tolerance = 1e-6
+        undecided = (densities > self.minimum_density + tolerance) & (
+            densities < self.maximum_density - tolerance
+        )
+        undecided_count = int(np.count_nonzero(undecided))
+        solid_count = int(
+            np.count_nonzero(densities >= self.maximum_density - tolerance)
+        )
+        solid_budget = self.solid_cell_budget
+
+        # A solid assignment is possible until the material budget is full.
+        # A void assignment is possible only if the remaining undecided cells
+        # can still fill that budget. Thus every completed design is feasible
+        # by construction instead of asking PPO to learn not to cheat.
+        allow_solid = solid_count < solid_budget
+        allow_void = solid_count + undecided_count - 1 >= solid_budget
+        can_assign_void = undecided & allow_void
+        can_assign_solid = undecided & allow_solid
+        return np.concatenate((can_assign_void, can_assign_solid))
+
+    @property
+    def solid_cell_budget(self):
+        """Nearest feasible solid-cell count for the requested volume."""
+        total_cells = self.width * self.height
+        continuous_budget = (
+            self.target_density * total_cells
+            - self.minimum_density * total_cells
+        ) / (self.maximum_density - self.minimum_density)
+        return int(np.clip(np.rint(continuous_budget), 0, total_cells))
 
     def check_connectivity(self, densities=None):
         """Return the fraction of solid cells outside the largest component.
@@ -295,15 +343,8 @@ class BeamOptimizationEnv(gym.Env):
             return 0.0
         return float((sum(components) - max(components)) / max(sum(components), 1))
 
-    def calculate_reward(self):
-        """Evaluate scale-invariant physical and density reward terms."""
-        densities = self.density_field()
-        compliance, volume_fraction = fem.optim(self.args, x=densities, verbose=False)
-        compliance = float(compliance)
-        volume_fraction = float(volume_fraction)
-        self.current_compliance = compliance
-        self.current_constraint = volume_fraction
-
+    def _objective_terms(self, densities, compliance, volume_fraction):
+        """Build the dimensionless constrained compliance objective."""
         if np.isfinite(compliance) and compliance > 0:
             compliance_ratio = compliance / self.base_compliance_value
         else:
@@ -314,32 +355,71 @@ class BeamOptimizationEnv(gym.Env):
         log_compliance_ratio = float(np.log10(max(compliance_ratio, 1e-12)))
         r_compliance = -self.w_compliance * log_compliance_ratio
 
-        grey_fraction = float(np.mean((densities > 0.2) & (densities < 0.8)))
-        r_grey = -self.w_grey * grey_fraction
-        density_extremeness = float(np.mean((0.5 - densities) ** 2))
-        r_density_low = self.w_density_low * density_extremeness
+        # Relative quantities retain exactly the same interpretation as the
+        # grid is refined from 6x6 to 50x50.
+        volume_error = (volume_fraction - self.target_density) / self.target_density
+        volume_violation = max(volume_error, 0.0)
+        volume_deviation = abs(volume_error)
+        volume_cost = self.w_total_mass * volume_error**2
+        r_mass = -volume_cost
 
-        # Relative volume violation is dimensionless and therefore has the
-        # same meaning on 6x6 and 50x50 grids.
-        volume_violation = max(volume_fraction - self.target_density, 0.0) / self.target_density
-        r_mass = -self.w_total_mass * volume_violation
-        reward = r_compliance + r_grey + r_density_low + r_mass
+        densities = np.asarray(densities)
+        binary_measure = float(np.mean(4.0 * densities * (1.0 - densities)))
+        binary_cost = self.w_binary * binary_measure
+        r_binary = -binary_cost
+
+        tolerance = 1e-6
+        solid_cells = int(
+            np.count_nonzero(densities >= self.maximum_density - tolerance)
+        )
+        undecided_cells = int(
+            np.count_nonzero(
+                (densities > self.minimum_density + tolerance)
+                & (densities < self.maximum_density - tolerance)
+            )
+        )
+
+        objective_cost = (
+            self.w_compliance * log_compliance_ratio + volume_cost + binary_cost
+        )
+        state_score = -objective_cost
         info = {
-            "raw_reward": float(reward),
+            "state_score": float(state_score),
+            # Compatibility name: this is the score of the current state,
+            # while step rewards are objective improvements.
+            "raw_reward": float(state_score),
+            "objective_cost": float(objective_cost),
             "compliance": compliance,
             "base_compliance": self.base_compliance_value,
             "compliance_ratio": float(compliance_ratio),
             "log_compliance_ratio": log_compliance_ratio,
             "volume_fraction": volume_fraction,
             "target_volume_fraction": self.target_density,
+            "volume_error": float(volume_error),
+            "volume_deviation": float(volume_deviation),
             "volume_violation": float(volume_violation),
             "constraint": volume_fraction,
+            "binary_measure": binary_measure,
+            "solid_cell_budget": self.solid_cell_budget,
+            "solid_cells": solid_cells,
+            "undecided_cells": undecided_cells,
+            "remaining_solid_budget": self.solid_cell_budget - solid_cells,
             "r_compliance": float(r_compliance),
-            "r_grey": float(r_grey),
-            "r_density_low": float(r_density_low),
             "r_mass": float(r_mass),
+            "r_binary": float(r_binary),
+            "valid_action_count": int(np.count_nonzero(self.valid_action_mask())),
         }
-        return float(reward), info
+        return float(state_score), info
+
+    def calculate_reward(self):
+        """Evaluate the current dimensionless constrained objective."""
+        densities = self.density_field()
+        compliance, volume_fraction = fem.optim(self.args, x=densities, verbose=False)
+        compliance = float(compliance)
+        volume_fraction = float(volume_fraction)
+        self.current_compliance = compliance
+        self.current_constraint = volume_fraction
+        return self._objective_terms(densities, compliance, volume_fraction)
 
     def step(self, action):
         """Increase or decrease one physical cell and evaluate the result."""
@@ -351,23 +431,31 @@ class BeamOptimizationEnv(gym.Env):
         cell = action % total_cells
         row, col = divmod(cell, self.width)
         direction = "increase" if action >= total_cells else "decrease"
-        progress = np.clip(self.current_step / self.max_steps, 0.0, 1.0)
-        self.step_size = max(
-            self.step_size_initial
-            - (self.step_size_initial - self.step_size_final) * progress,
-            self.step_size_final,
-        )
 
         compliance_before = self.previous_compliance
         old_density = float(self.state[0, row, col])
-        delta = self.step_size if direction == "increase" else -self.step_size
-        new_density = float(np.clip(old_density + delta, 0.001, 1.0))
+        action_was_valid = bool(self.valid_action_mask()[action])
+        if action_was_valid:
+            new_density = (
+                self.maximum_density
+                if direction == "increase"
+                else self.minimum_density
+            )
+        else:
+            new_density = old_density
+        self.step_size = abs(new_density - old_density)
         changed = not np.isclose(new_density, old_density)
         self.state[0, row, col] = new_density
-        reward_action = 0.05 if changed else -0.05
+        # A successful edit is not an achievement by itself. The previous
+        # +0.05 paid the policy merely to push cells to a bound.
+        reward_action = 0.0 if changed else -0.05
         self.current_step += 1
 
-        main_reward, reward_info = self.calculate_reward()
+        previous_objective = self.previous_objective
+        _, reward_info = self.calculate_reward()
+        self.current_objective = reward_info["objective_cost"]
+        main_reward = previous_objective - self.current_objective
+        self.previous_objective = self.current_objective
         compliance_after = self.current_compliance
         self.previous_compliance = compliance_after
         if (
@@ -377,32 +465,41 @@ class BeamOptimizationEnv(gym.Env):
             and compliance_after > 0
         ):
             compliance_diff = compliance_before - compliance_after
-            reward_improvement = (
-                self.improvement_scale
-                * np.log10(compliance_before / compliance_after)
-            )
+            compliance_improvement = np.log10(compliance_before / compliance_after)
         else:
             compliance_diff = 0.0
-            reward_improvement = 0.0
+            compliance_improvement = 0.0
 
-        reward = float(np.clip(reward_action + main_reward + reward_improvement, -10.0, 10.0))
+        # Potential-difference shaping pays only for improving the actual
+        # constrained objective. It does not repeatedly collect a state bonus
+        # for removing early in the episode.
+        reward = float(np.clip(reward_action + main_reward, -10.0, 10.0))
         compliance_ratio = reward_info["compliance_ratio"]
-        is_new_best = compliance_ratio < self.best_compliance_ratio
+        is_new_best = self.current_objective < self.best_objective
         if is_new_best:
+            self.best_objective = self.current_objective
             self.best_compliance_ratio = compliance_ratio
         self.reward = reward
-        terminated = self.current_step >= self.max_steps
+        terminated = self.current_step >= self.max_steps or not self.valid_action_mask().any()
         info = {
             **reward_info,
             "compliance_before": float(compliance_before),
             "compliance_after": float(compliance_after),
             "compliance_diff": float(compliance_diff),
-            "reward_improvement": float(reward_improvement),
+            "compliance_improvement": float(compliance_improvement),
+            # Compatibility alias; this diagnostic is not added twice.
+            "reward_improvement": float(compliance_improvement),
             "reward_action": float(reward_action),
             "reward_main": float(main_reward),
+            "objective_before": float(previous_objective),
+            "objective_after": float(self.current_objective),
+            "action_changed_density": bool(changed),
+            "action_was_valid": action_was_valid,
             "best_compliance_ratio": float(self.best_compliance_ratio),
+            "best_objective": float(self.best_objective),
             "is_new_best": bool(is_new_best),
             "direction": direction,
+            "assignment": "solid" if direction == "increase" else "void",
             "cell": int(cell),
             "row": int(row),
             "col": int(col),
@@ -414,11 +511,29 @@ class BeamOptimizationEnv(gym.Env):
     def render(self):
         grid = self.density_field()
         plt.figure(figsize=(6, 6))
-        plt.imshow(grid, cmap="viridis", interpolation="nearest", vmin=0, vmax=1)
-        plt.colorbar()
+        image = plt.imshow(
+            grid, cmap="gray_r", interpolation="nearest", vmin=0, vmax=1
+        )
+        colorbar = plt.colorbar(image)
+        colorbar.set_label("Density (0 = void, 1 = solid)")
+        if max(self.width, self.height) <= 12:
+            for row in range(self.height):
+                for col in range(self.width):
+                    density = grid[row, col]
+                    text_color = "white" if density > 0.55 else "black"
+                    plt.text(
+                        col,
+                        row,
+                        f"{density:.2f}",
+                        ha="center",
+                        va="center",
+                        color=text_color,
+                        fontsize=8,
+                    )
         plt.title(
             f"Step: {self.current_step} | Reward: {self.reward:.3f} | "
-            f"Compliance: {self.current_compliance:.3f}"
+            f"C/C0: {self.current_compliance / self.base_compliance_value:.3f} | "
+            f"Volume: {self.current_constraint:.3f}/{self.target_density:.3f}"
         )
         plt.xlabel("X / width")
         plt.ylabel("Y / height")

@@ -123,6 +123,7 @@ class _SpatialActorCritic(nn.Module):
         observation_width,
         has_continuous_action_space,
         action_std_init,
+        target_density=0.4,
     ):
         super().__init__()
         self.num_actions = int(num_actions)
@@ -131,6 +132,7 @@ class _SpatialActorCritic(nn.Module):
         self.grid_height = self.observation_height - 1
         self.grid_width = self.observation_width - 1
         self.has_continuous_action_space = bool(has_continuous_action_space)
+        self.target_density = float(target_density)
         expected_actions = 2 * self.grid_height * self.grid_width
         if self.grid_height < 1 or self.grid_width < 1:
             raise ValueError("observations must include at least a 1x1 element grid plus nodes")
@@ -141,6 +143,8 @@ class _SpatialActorCritic(nn.Module):
             )
         if action_std_init <= 0:
             raise ValueError("action_std_init must be positive")
+        if not 0.001 < self.target_density < 1.0:
+            raise ValueError("target_density must lie strictly between 0.001 and 1")
         self.register_buffer("action_std", torch.tensor(float(action_std_init)))
 
     def _finish_heads(self):
@@ -193,19 +197,59 @@ class _SpatialActorCritic(nn.Module):
         pooled = self.critic_pool(features).flatten(start_dim=1)
         return self.critic_head(pooled).squeeze(-1)
 
-    def distribution(self, actor_output):
+    def valid_action_mask(self, states):
+        """Mask both assignments for cells already decided void or solid."""
+        densities = states[
+            :, 0, : self.grid_height, : self.grid_width
+        ].flatten(start_dim=1)
+        tolerance = 1e-6
+        undecided = (densities > 0.001 + tolerance) & (
+            densities < 1.0 - tolerance
+        )
+        undecided_count = undecided.sum(dim=1)
+        total_cells = self.grid_height * self.grid_width
+        continuous_budget = (
+            self.target_density * total_cells - 0.001 * total_cells
+        ) / (1.0 - 0.001)
+        solid_budget = int(round(continuous_budget))
+        solid_budget = min(max(solid_budget, 0), total_cells)
+        solid_count = (densities >= 1.0 - tolerance).sum(dim=1)
+
+        allow_solid = (solid_count < solid_budget).unsqueeze(1)
+        allow_void = (
+            solid_count + undecided_count - 1 >= solid_budget
+        ).unsqueeze(1)
+        can_assign_void = undecided & allow_void
+        can_assign_solid = undecided & allow_solid
+        action_mask = torch.cat((can_assign_void, can_assign_solid), dim=1)
+        if action_mask.shape[1] != self.num_actions:
+            raise RuntimeError("density-derived action-mask size mismatch")
+        if not bool(action_mask.any(dim=1).all()):
+            raise RuntimeError("the policy was asked to act on a completed design")
+        return action_mask
+
+    def distribution(self, actor_output, states=None):
         if self.has_continuous_action_space:
             std = self.action_std.expand_as(actor_output)
             return Independent(Normal(actor_output, std), 1)
-        return Categorical(logits=actor_output)
+        if states is None:
+            raise ValueError("states are required to mask invalid discrete actions")
+        action_mask = self.valid_action_mask(states)
+        masked_logits = actor_output.masked_fill(
+            ~action_mask, torch.finfo(actor_output.dtype).min
+        )
+        return Categorical(logits=masked_logits)
 
     def act(self, states, deterministic=False):
         self._validate_states(states)
         features = self.forward_features(states)
         actor_output = self.action_output(features)
-        distribution = self.distribution(actor_output)
+        distribution = self.distribution(actor_output, states)
         if deterministic:
-            actions = actor_output if self.has_continuous_action_space else actor_output.argmax(dim=-1)
+            if self.has_continuous_action_space:
+                actions = actor_output
+            else:
+                actions = distribution.probs.argmax(dim=-1)
         else:
             actions = distribution.sample()
         return actions, distribution.log_prob(actions), self.value_from_features(features)
@@ -213,7 +257,7 @@ class _SpatialActorCritic(nn.Module):
     def evaluate(self, states, actions):
         self._validate_states(states)
         features = self.forward_features(states)
-        distribution = self.distribution(self.action_output(features))
+        distribution = self.distribution(self.action_output(features), states)
         return (
             distribution.log_prob(actions),
             self.value_from_features(features),
@@ -241,6 +285,7 @@ class CNNActorCritic(_SpatialActorCritic):
         height,
         has_continuous_action_space,
         action_std_init,
+        target_density=0.4,
         dropout_rate=0.0,
     ):
         del dropout_rate
@@ -250,6 +295,7 @@ class CNNActorCritic(_SpatialActorCritic):
             observation_width=height,
             has_continuous_action_space=has_continuous_action_space,
             action_std_init=action_std_init,
+            target_density=target_density,
         )
         self.encoder = nn.Sequential(
             nn.Conv2d(num_channels, 64, kernel_size=3, padding=1),
@@ -281,6 +327,7 @@ class TwoPathActorCritic(_SpatialActorCritic):
         height,
         has_continuous_action_space,
         action_std_init,
+        target_density=0.4,
         dropout_rate=0.0,
     ):
         del dropout_rate
@@ -290,6 +337,7 @@ class TwoPathActorCritic(_SpatialActorCritic):
             observation_width=height,
             has_continuous_action_space=has_continuous_action_space,
             action_std_init=action_std_init,
+            target_density=target_density,
         )
         self.density_encoder = nn.Sequential(
             nn.Conv2d(1, 64, kernel_size=3, padding=1),
@@ -355,6 +403,7 @@ class PPO:
         value_coef=0.5,
         entropy_coef=0.01,
         max_grad_norm=0.5,
+        target_density=0.4,
     ):
         self.device = torch.device(device)
         self.has_continuous_action_space = bool(has_continuous_action_space)
@@ -380,6 +429,7 @@ class PPO:
         self.value_coef = float(value_coef)
         self.entropy_coef = float(entropy_coef)
         self.max_grad_norm = float(max_grad_norm)
+        self.target_density = float(target_density)
         if self.rollout_steps < 1 or self.minibatch_size < 1 or self.K_epochs < 1:
             raise ValueError("rollout_steps, minibatch_size, and K_epochs must be positive")
         if self.minibatch_size != requested_minibatch_size:
@@ -406,6 +456,7 @@ class PPO:
             height=self.width,
             has_continuous_action_space=self.has_continuous_action_space,
             action_std_init=action_std_init,
+            target_density=self.target_density,
         )
         if model_class is CNNActorCritic:
             model_kwargs["num_channels"] = self.state_channels
@@ -623,6 +674,7 @@ class PPO:
                 "architecture": "two_path" if self.use_two_path else "single_path",
                 "observation_shape": (self.state_channels, self.height, self.width),
                 "action_dim": self.action_dim,
+                "target_density": self.target_density,
             },
             checkpoint_path,
         )
@@ -631,6 +683,13 @@ class PPO:
         checkpoint = torch.load(
             checkpoint_path, map_location=self.device, weights_only=True
         )
+        saved_target_density = checkpoint.get("target_density")
+        if saved_target_density is not None and not math.isclose(
+            float(saved_target_density), self.target_density, rel_tol=0.0, abs_tol=1e-12
+        ):
+            raise ValueError(
+                "checkpoint target density does not match the current PPO agent"
+            )
         self.policy_old.load_state_dict(checkpoint["policy_state_dict"])
         self.policy.load_state_dict(checkpoint["policy_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
