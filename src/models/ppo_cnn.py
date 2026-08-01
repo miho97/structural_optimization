@@ -1,598 +1,658 @@
+"""Fully convolutional PPO for grid-based structural optimization."""
+
+from __future__ import annotations
+
+import math
+
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.distributions import MultivariateNormal, Categorical
-import numpy as np
-import matplotlib.pyplot as plt
-from torch import amp
+from torch.distributions import Categorical, Independent, Normal
 
-# Device configuration
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 class RolloutBuffer:
-    def __init__(self, max_size, num_envs, channels, width, height, action_dtype=torch.long, buffer_device='cpu'):
-        self.num_envs = num_envs
-        self.max_size = max_size
-        self.ptr = 0
-        self.buffer_device = buffer_device
+    """Fixed-horizon rollout storage kept on CPU."""
 
-        # States: [max_size, num_envs, channels, width, height] - stored on CPU to save GPU memory
-        self.states = torch.zeros((max_size, num_envs, channels, width, height), device=buffer_device)
-        self.actions = torch.zeros((max_size, num_envs), dtype=action_dtype, device=buffer_device)  
-        self.logprobs = torch.zeros((max_size, num_envs), device=buffer_device)
-        self.rewards = torch.zeros((max_size, num_envs), device=buffer_device)
-        self.state_values = torch.zeros((max_size, num_envs), device=buffer_device)
-        self.is_terminals = torch.zeros((max_size, num_envs), dtype=torch.bool, device=buffer_device)
+    def __init__(
+        self,
+        max_size,
+        num_envs,
+        channels,
+        height,
+        width,
+        action_dim,
+        continuous_actions=False,
+        buffer_device="cpu",
+    ):
+        if max_size < 1 or num_envs < 1:
+            raise ValueError("max_size and num_envs must be positive")
+        self.num_envs = int(num_envs)
+        self.max_size = int(max_size)
+        self.ptr = 0
+        self.buffer_device = torch.device(buffer_device)
+        self.continuous_actions = bool(continuous_actions)
+
+        self.states = torch.empty(
+            (max_size, num_envs, channels, height, width),
+            dtype=torch.float32,
+            device=self.buffer_device,
+        )
+        if self.continuous_actions:
+            self.actions = torch.empty(
+                (max_size, num_envs, action_dim),
+                dtype=torch.float32,
+                device=self.buffer_device,
+            )
+        else:
+            self.actions = torch.empty(
+                (max_size, num_envs), dtype=torch.long, device=self.buffer_device
+            )
+        self.logprobs = torch.empty((max_size, num_envs), device=self.buffer_device)
+        self.rewards = torch.empty((max_size, num_envs), device=self.buffer_device)
+        self.state_values = torch.empty((max_size, num_envs), device=self.buffer_device)
+        self.is_terminals = torch.empty(
+            (max_size, num_envs), dtype=torch.bool, device=self.buffer_device
+        )
+
+    @property
+    def is_full(self):
+        return self.ptr == self.max_size
 
     def store(self, states, actions, logprobs, rewards, state_values, is_terminals):
-        if self.ptr >= self.max_size:
-            raise IndexError("RolloutBuffer is full")
-        # Move tensors to buffer device (CPU) for storage
-        self.states[self.ptr] = states.to(self.buffer_device)
-        self.actions[self.ptr] = actions.to(self.buffer_device)
-        self.logprobs[self.ptr] = logprobs.to(self.buffer_device)
-        self.rewards[self.ptr] = rewards.to(self.buffer_device)
-        self.state_values[self.ptr] = state_values.to(self.buffer_device)
-        self.is_terminals[self.ptr] = is_terminals.to(self.buffer_device)
+        if self.is_full:
+            raise IndexError(
+                f"rollout buffer is full ({self.max_size} steps); update PPO before storing more"
+            )
+        values = (states, actions, logprobs, rewards, state_values, is_terminals)
+        if any(not isinstance(value, torch.Tensor) for value in values):
+            raise TypeError("all rollout values must be torch tensors")
+        self.states[self.ptr].copy_(states.detach().to(self.buffer_device))
+        self.actions[self.ptr].copy_(actions.detach().to(self.buffer_device))
+        self.logprobs[self.ptr].copy_(logprobs.detach().to(self.buffer_device))
+        self.rewards[self.ptr].copy_(rewards.detach().to(self.buffer_device))
+        self.state_values[self.ptr].copy_(state_values.detach().to(self.buffer_device))
+        self.is_terminals[self.ptr].copy_(is_terminals.detach().to(self.buffer_device))
         self.ptr += 1
 
     def clear(self):
         self.ptr = 0
 
 
-import torch.nn.functional as F
+class DilatedSpatialContext(nn.Module):
+    """Expand the actor receptive field without resolution-dependent weights."""
 
-class CNNActorCritic(nn.Module):
-    def __init__(self, num_channels, num_actions, width, height, has_continuous_action_space, action_std_init, dropout_rate=0.3):
-        super(CNNActorCritic, self).__init__()
-        self.has_continuous_action_space = has_continuous_action_space
-
-        # Define CNN layers
-        self.conv1 = nn.Conv2d(num_channels, 32, kernel_size=3, padding=1)  # Output: 32 x W x H
-        self.bn1 = nn.BatchNorm2d(32)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)            # Output: 64 x W x H
-        self.bn2 = nn.BatchNorm2d(64)
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)           # Output: 128 x W x H
-        self.bn3 = nn.BatchNorm2d(128)
-
-        # Compute the size after convolution to flatten
-        self.width = width
-        self.height = height
-        self.flatten_dim = 128 * self.width * self.height
-
-        # Fully connected layers (ReLU + 10% dropout for better gradient flow)
-        self.fc_actor = nn.Sequential(
-            nn.Linear(self.flatten_dim, 256),
-            nn.LayerNorm(256),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, 256),
-            nn.LayerNorm(256),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, num_actions),
-            nn.Tanh() if has_continuous_action_space else nn.Softmax(dim=-1)
+    def __init__(self, channels, dilations=(2, 4, 8, 16)):
+        super().__init__()
+        self.dilations = tuple(dilations)
+        self.blocks = nn.ModuleList(
+            nn.Sequential(
+                nn.Conv2d(
+                    channels,
+                    channels,
+                    kernel_size=3,
+                    padding=dilation,
+                    dilation=dilation,
+                ),
+                nn.GroupNorm(16, channels),
+                nn.ReLU(),
+            )
+            for dilation in self.dilations
         )
 
-        self.fc_critic = nn.Sequential(
-            nn.Linear(self.flatten_dim, 256),
-            nn.LayerNorm(256),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, 256),
-            nn.LayerNorm(256),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, 1)
+    def forward(self, features):
+        for block in self.blocks:
+            # Residual propagation retains precise local information while
+            # each dilation communicates over an increasingly large radius.
+            features = features + block(features)
+        return features
+
+
+class _SpatialActorCritic(nn.Module):
+    """Distribution/value behavior shared by both convolutional encoders."""
+
+    feature_channels: int
+
+    def __init__(
+        self,
+        num_actions,
+        observation_height,
+        observation_width,
+        has_continuous_action_space,
+        action_std_init,
+    ):
+        super().__init__()
+        self.num_actions = int(num_actions)
+        self.observation_height = int(observation_height)
+        self.observation_width = int(observation_width)
+        self.grid_height = self.observation_height - 1
+        self.grid_width = self.observation_width - 1
+        self.has_continuous_action_space = bool(has_continuous_action_space)
+        expected_actions = 2 * self.grid_height * self.grid_width
+        if self.grid_height < 1 or self.grid_width < 1:
+            raise ValueError("observations must include at least a 1x1 element grid plus nodes")
+        if self.num_actions != expected_actions:
+            raise ValueError(
+                f"expected {expected_actions} actions for a {self.grid_height}x{self.grid_width} "
+                f"grid, got {self.num_actions}"
+            )
+        if action_std_init <= 0:
+            raise ValueError("action_std_init must be positive")
+        self.register_buffer("action_std", torch.tensor(float(action_std_init)))
+
+    def _finish_heads(self):
+        self.actor_head = nn.Conv2d(self.feature_channels, 2, kernel_size=1)
+        self.critic_pool = nn.AdaptiveAvgPool2d(1)
+        self.critic_head = nn.Sequential(
+            nn.Linear(self.feature_channels, 256),
+            nn.Tanh(),
+            nn.Linear(256, 1),
         )
+        self.apply(self._initialize_layer)
+        nn.init.orthogonal_(self.actor_head.weight, gain=0.01)
+        nn.init.zeros_(self.actor_head.bias)
+        nn.init.orthogonal_(self.critic_head[-1].weight, gain=1.0)
+        nn.init.zeros_(self.critic_head[-1].bias)
 
-        # Initialize weights
-        self.apply(self.weights_init_)
+    @staticmethod
+    def _initialize_layer(layer):
+        if isinstance(layer, (nn.Conv2d, nn.Linear)):
+            nn.init.orthogonal_(layer.weight, gain=math.sqrt(2))
+            if layer.bias is not None:
+                nn.init.zeros_(layer.bias)
 
-        # For continuous action space
-        if self.has_continuous_action_space:
-            self.action_var = torch.full((num_actions,), action_std_init ** 2).to(device)
+    def _validate_states(self, states):
+        if states.ndim != 4:
+            raise ValueError("states must have shape (batch, channels, height, width)")
+        if tuple(states.shape[-2:]) != (
+            self.observation_height,
+            self.observation_width,
+        ):
+            raise ValueError(
+                f"expected spatial shape {(self.observation_height, self.observation_width)}, "
+                f"got {tuple(states.shape[-2:])}"
+            )
 
-    def weights_init_(self, m):
-        if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
-            torch.nn.init.kaiming_uniform_(m.weight, a=0, mode='fan_in', nonlinearity='relu')
-            if m.bias is not None:
-                torch.nn.init.constant_(m.bias, 0)
-
-    def forward(self):
+    def forward_features(self, states):
         raise NotImplementedError
 
-    def act(self, states):
-        """
-        Given states, select actions, log probabilities, and state values.
-        """
-        # Forward pass through CNN
-        x = F.relu(self.bn1(self.conv1(states)))  # [batch_size, 32, W, H]
-        x = F.relu(self.bn2(self.conv2(x)))       # [batch_size, 64, W, H]
-        x = F.relu(self.bn3(self.conv3(x)))       # [batch_size, 128, W, H]
-        x = x.view(x.size(0), -1)                 # [batch_size, 128*W*H]
+    def action_output(self, features):
+        # The observation has one padded row and column for nodal channels.
+        # Cropping guarantees that padded locations can never become actions.
+        output = self.actor_head(features)[
+            :, :, : self.grid_height, : self.grid_width
+        ].flatten(start_dim=1)
+        if output.shape[1] != self.num_actions:
+            raise RuntimeError("actor output/action-space mismatch")
+        return torch.tanh(output) if self.has_continuous_action_space else output
 
-        # Actor
-        action_probs = self.fc_actor(x)           # [batch_size, num_actions]
+    def value_from_features(self, features):
+        pooled = self.critic_pool(features).flatten(start_dim=1)
+        return self.critic_head(pooled).squeeze(-1)
+
+    def distribution(self, actor_output):
         if self.has_continuous_action_space:
-            action_mean = action_probs             # For continuous, interpret as mean
-            action_var = self.action_var.expand_as(action_mean)
-            cov_mat = torch.diag_embed(action_var)
-            dist = MultivariateNormal(action_mean, cov_mat)
-            actions = dist.sample()
-            action_logprobs = dist.log_prob(actions)
+            std = self.action_std.expand_as(actor_output)
+            return Independent(Normal(actor_output, std), 1)
+        return Categorical(logits=actor_output)
+
+    def act(self, states, deterministic=False):
+        self._validate_states(states)
+        features = self.forward_features(states)
+        actor_output = self.action_output(features)
+        distribution = self.distribution(actor_output)
+        if deterministic:
+            actions = actor_output if self.has_continuous_action_space else actor_output.argmax(dim=-1)
         else:
-            dist = Categorical(action_probs)
-            actions = dist.sample()
-            action_logprobs = dist.log_prob(actions)
-
-        # Critic
-        state_values = self.fc_critic(x).squeeze(-1)  # [batch_size]
-
-        return actions, action_logprobs, state_values
+            actions = distribution.sample()
+        return actions, distribution.log_prob(actions), self.value_from_features(features)
 
     def evaluate(self, states, actions):
-        """
-        Given states and actions, evaluate log probabilities, state values, and entropy.
-        """
-        # Forward pass through CNN
-        x = F.relu(self.bn1(self.conv1(states)))  # [batch_size, 32, W, H]
-        x = F.relu(self.bn2(self.conv2(x)))       # [batch_size, 64, W, H]
-        x = F.relu(self.bn3(self.conv3(x)))       # [batch_size, 128, W, H]
-        x = x.view(x.size(0), -1)                 # [batch_size, 128*W*H]
+        self._validate_states(states)
+        features = self.forward_features(states)
+        distribution = self.distribution(self.action_output(features))
+        return (
+            distribution.log_prob(actions),
+            self.value_from_features(features),
+            distribution.entropy(),
+        )
 
-        # Actor
-        action_probs = self.fc_actor(x)           # [batch_size, num_actions]
-        if self.has_continuous_action_space:
-            action_mean = action_probs             # For continuous, interpret as mean
-            action_var = self.action_var.expand_as(action_mean)
-            cov_mat = torch.diag_embed(action_var)
-            dist = MultivariateNormal(action_mean, cov_mat)
+    def value(self, states):
+        self._validate_states(states)
+        return self.value_from_features(self.forward_features(states))
 
-            action_logprobs = dist.log_prob(actions)
-            dist_entropy = dist.entropy()
-        else:
-            dist = Categorical(action_probs)
-            action_logprobs = dist.log_prob(actions)
-            dist_entropy = dist.entropy()
-
-        # Critic
-        state_values = self.fc_critic(x).squeeze(-1)  # [batch_size]
-
-        return action_logprobs, state_values, dist_entropy
+    def set_action_std(self, new_action_std):
+        if new_action_std <= 0:
+            raise ValueError("action standard deviation must be positive")
+        self.action_std.fill_(float(new_action_std))
 
 
-class TwoPathActorCritic(nn.Module):
-    """
-    Two-path CNN architecture with separate encoders for:
-    - Path 1: Density channel (1 channel) - the changing state
-    - Path 2: Boundary conditions (4 channels) - forces and normals (static per episode)
-    
-    This forces the network to explicitly encode boundary condition information
-    rather than ignoring it in favor of the more dynamic density channel.
-    """
-    def __init__(self, num_actions, width, height, has_continuous_action_space, action_std_init, dropout_rate=0.1):
-        super(TwoPathActorCritic, self).__init__()
-        self.has_continuous_action_space = has_continuous_action_space
-        self.width = width
-        self.height = height
+class CNNActorCritic(_SpatialActorCritic):
+    """Single-path, fully convolutional actor with a pooled critic."""
 
-        # ============ Path 1: Density Encoder (1 channel) - WIDER ============
-        self.density_encoder = nn.Sequential(
-            nn.Conv2d(1, 64, kernel_size=3, padding=1),      # Was 32
-            nn.BatchNorm2d(64),
+    def __init__(
+        self,
+        num_channels,
+        num_actions,
+        width,
+        height,
+        has_continuous_action_space,
+        action_std_init,
+        dropout_rate=0.0,
+    ):
+        del dropout_rate
+        super().__init__(
+            num_actions,
+            observation_height=width,
+            observation_width=height,
+            has_continuous_action_space=has_continuous_action_space,
+            action_std_init=action_std_init,
+        )
+        self.encoder = nn.Sequential(
+            nn.Conv2d(num_channels, 64, kernel_size=3, padding=1),
+            nn.GroupNorm(8, 64),
             nn.ReLU(),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),    # Was 64
-            nn.BatchNorm2d(128),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.GroupNorm(16, 128),
             nn.ReLU(),
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),   # Was 64
-            nn.BatchNorm2d(128),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.GroupNorm(16, 128),
             nn.ReLU(),
         )
-        
-        # ============ Path 2: Boundary Condition Encoder (4 channels) - WIDER ============
-        self.bc_encoder = nn.Sequential(
-            nn.Conv2d(4, 64, kernel_size=3, padding=1),      # Was 32
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),    # Was 64
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),   # Was 64
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-        )
-        
-        # ============ Fusion Layer - WIDER ============
-        # Combine features from both paths
-        self.fusion_conv = nn.Sequential(
-            nn.Conv2d(256, 256, kernel_size=3, padding=1),   # Was 128 → 128
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-        )
-        
-        # Flatten dimension after fusion - UPDATED
-        self.flatten_dim = 256 * width * height              # Was 128
-        
-        # ============ Actor Head - WIDER ============
-        self.fc_actor = nn.Sequential(
-            nn.Linear(self.flatten_dim, 512),                # Was 256
-            nn.LayerNorm(512),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(512, 512),                             # Was 256
-            nn.LayerNorm(512),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(512, num_actions),
-            nn.Tanh() if has_continuous_action_space else nn.Softmax(dim=-1)
-        )
-        
-        # ============ Critic Head - WIDER ============
-        self.fc_critic = nn.Sequential(
-            nn.Linear(self.flatten_dim, 512),                # Was 256
-            nn.LayerNorm(512),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(512, 512),                             # Was 256
-            nn.LayerNorm(512),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(512, 1)
-        )
-        
-        # Initialize weights
-        self.apply(self.weights_init_)
-        
-        # For continuous action space
-        if self.has_continuous_action_space:
-            self.action_var = torch.full((num_actions,), action_std_init ** 2).to(device)
-    
-    def weights_init_(self, m):
-        if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
-            torch.nn.init.kaiming_uniform_(m.weight, a=0, mode='fan_in', nonlinearity='relu')
-            if m.bias is not None:
-                torch.nn.init.constant_(m.bias, 0)
-    
+        self.feature_channels = 128
+        self.spatial_context = DilatedSpatialContext(self.feature_channels)
+        self.receptive_field = 7 + 2 * sum(self.spatial_context.dilations)
+        self._finish_heads()
+
     def forward_features(self, states):
-        """Extract features from both paths and fuse them."""
-        # Split state into density and boundary conditions
-        density = states[:, 0:1, :, :]   # Channel 0: densities
-        bc = states[:, 1:5, :, :]        # Channels 1-4: normals_x, normals_y, forces_x, forces_y
-        
-        # Encode each path separately
-        feat_density = self.density_encoder(density)   # [batch, 64, W, H]
-        feat_bc = self.bc_encoder(bc)                  # [batch, 64, W, H]
-        
-        # Concatenate and fuse
-        fused = torch.cat([feat_density, feat_bc], dim=1)  # [batch, 128, W, H]
-        fused = self.fusion_conv(fused)                     # [batch, 128, W, H]
-        
-        # Flatten
-        return fused.view(fused.size(0), -1)  # [batch, 128*W*H]
-    
-    def act(self, states):
-        """Given states, select actions, log probabilities, and state values."""
-        x = self.forward_features(states)
-        
-        # Actor
-        action_probs = self.fc_actor(x)
-        if self.has_continuous_action_space:
-            action_mean = action_probs
-            action_var = self.action_var.expand_as(action_mean)
-            cov_mat = torch.diag_embed(action_var)
-            dist = MultivariateNormal(action_mean, cov_mat)
-            actions = dist.sample()
-            action_logprobs = dist.log_prob(actions)
-        else:
-            dist = Categorical(action_probs)
-            actions = dist.sample()
-            action_logprobs = dist.log_prob(actions)
-        
-        # Critic
-        state_values = self.fc_critic(x).squeeze(-1)
-        
-        return actions, action_logprobs, state_values
-    
-    def evaluate(self, states, actions):
-        """Given states and actions, evaluate log probabilities, state values, and entropy."""
-        x = self.forward_features(states)
-        
-        # Actor
-        action_probs = self.fc_actor(x)
-        if self.has_continuous_action_space:
-            action_mean = action_probs
-            action_var = self.action_var.expand_as(action_mean)
-            cov_mat = torch.diag_embed(action_var)
-            dist = MultivariateNormal(action_mean, cov_mat)
-            action_logprobs = dist.log_prob(actions)
-            dist_entropy = dist.entropy()
-        else:
-            dist = Categorical(action_probs)
-            action_logprobs = dist.log_prob(actions)
-            dist_entropy = dist.entropy()
-        
-        # Critic
-        state_values = self.fc_critic(x).squeeze(-1)
-        
-        return action_logprobs, state_values, dist_entropy
+        return self.spatial_context(self.encoder(states))
+
+
+class TwoPathActorCritic(_SpatialActorCritic):
+    """Separate density and boundary-condition encoders with spatial fusion."""
+
+    def __init__(
+        self,
+        num_actions,
+        width,
+        height,
+        has_continuous_action_space,
+        action_std_init,
+        dropout_rate=0.0,
+    ):
+        del dropout_rate
+        super().__init__(
+            num_actions,
+            observation_height=width,
+            observation_width=height,
+            has_continuous_action_space=has_continuous_action_space,
+            action_std_init=action_std_init,
+        )
+        self.density_encoder = nn.Sequential(
+            nn.Conv2d(1, 64, kernel_size=3, padding=1),
+            nn.GroupNorm(8, 64),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.GroupNorm(16, 128),
+            nn.ReLU(),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.GroupNorm(16, 128),
+            nn.ReLU(),
+        )
+        self.bc_encoder = nn.Sequential(
+            nn.Conv2d(4, 64, kernel_size=3, padding=1),
+            nn.GroupNorm(8, 64),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.GroupNorm(16, 128),
+            nn.ReLU(),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.GroupNorm(16, 128),
+            nn.ReLU(),
+        )
+        self.fusion_conv = nn.Sequential(
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.GroupNorm(16, 256),
+            nn.ReLU(),
+        )
+        self.feature_channels = 256
+        self.spatial_context = DilatedSpatialContext(self.feature_channels)
+        self.receptive_field = 9 + 2 * sum(self.spatial_context.dilations)
+        self._finish_heads()
+
+    def forward_features(self, states):
+        density_features = self.density_encoder(states[:, 0:1])
+        boundary_features = self.bc_encoder(states[:, 1:5])
+        fused = self.fusion_conv(
+            torch.cat((density_features, boundary_features), dim=1)
+        )
+        return self.spatial_context(fused)
 
 
 class PPO:
-    def __init__(self, state_channels, width, height, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip,
-                 has_continuous_action_space, action_std_init=0.6, gae_lambda=0.95, num_envs=1, device=device,
-                 use_two_path=False):
-        
-        self.has_continuous_action_space = has_continuous_action_space
-        self.num_envs = num_envs
-        self.use_two_path = use_two_path
+    def __init__(
+        self,
+        state_channels,
+        width,
+        height,
+        action_dim,
+        lr_actor,
+        lr_critic,
+        gamma,
+        K_epochs,
+        eps_clip,
+        has_continuous_action_space,
+        action_std_init=0.6,
+        gae_lambda=0.95,
+        num_envs=1,
+        device=device,
+        use_two_path=False,
+        rollout_steps=128,
+        minibatch_size=1024,
+        value_coef=0.5,
+        entropy_coef=0.01,
+        max_grad_norm=0.5,
+    ):
+        self.device = torch.device(device)
+        self.has_continuous_action_space = bool(has_continuous_action_space)
+        self.num_envs = int(num_envs)
+        self.use_two_path = bool(use_two_path)
+        self.gamma = float(gamma)
+        self.gae_lambda = float(gae_lambda)
+        self.eps_clip = float(eps_clip)
+        self.K_epochs = int(K_epochs)
+        self.state_channels = int(state_channels)
+        # These legacy argument names are observation height and width because
+        # callers pass state.shape[1] and state.shape[2].
+        self.height = int(width)
+        self.width = int(height)
+        self.action_dim = int(action_dim)
+        self.rollout_steps = int(rollout_steps)
+        requested_minibatch_size = int(minibatch_size)
+        # Bound activation memory by spatial pixels. This keeps the convenient
+        # 1024-sample batches on 6x6 while automatically reducing them on
+        # large grids (about 100 samples on 50x50).
+        spatial_batch_limit = max(1, 65_536 // (self.height * self.width))
+        self.minibatch_size = min(requested_minibatch_size, spatial_batch_limit)
+        self.value_coef = float(value_coef)
+        self.entropy_coef = float(entropy_coef)
+        self.max_grad_norm = float(max_grad_norm)
+        if self.rollout_steps < 1 or self.minibatch_size < 1 or self.K_epochs < 1:
+            raise ValueError("rollout_steps, minibatch_size, and K_epochs must be positive")
+        if self.minibatch_size != requested_minibatch_size:
+            print(
+                f"Reducing minibatch size from {requested_minibatch_size} to "
+                f"{self.minibatch_size} for {self.height}x{self.width} observations"
+            )
 
-        self.gamma = gamma
-        self.gae_lambda = gae_lambda  
-        self.eps_clip = eps_clip
-        self.K_epochs = K_epochs
-        self.state_channels = state_channels
-        self.width = width
-        self.height = height
-
-        # Initialize buffer on CPU to save GPU memory
         self.buffer = RolloutBuffer(
-            max_size=500,  # Reduced from 10000 - only need enough for a few episodes
-            num_envs=num_envs, 
-            channels=state_channels, 
-            width=width, 
-            height=height,
-            buffer_device='cpu'
+            max_size=self.rollout_steps,
+            num_envs=self.num_envs,
+            channels=self.state_channels,
+            height=self.height,
+            width=self.width,
+            action_dim=self.action_dim,
+            continuous_actions=self.has_continuous_action_space,
+            buffer_device="cpu",
         )
 
-        # Initialize ActorCritic - choose architecture based on use_two_path flag
-        if use_two_path:
-            print("Using TwoPathActorCritic (force encoder architecture)")
-            self.policy = TwoPathActorCritic(
-                num_actions=action_dim, 
-                width=width, 
-                height=height, 
-                has_continuous_action_space=has_continuous_action_space, 
-                action_std_init=action_std_init
-            ).to(device)
-            
-            # Optimizer for two-path architecture
-            self.optimizer = optim.Adam([
-                {'params': self.policy.density_encoder.parameters(), 'lr': lr_actor},
-                {'params': self.policy.bc_encoder.parameters(), 'lr': lr_actor},
-                {'params': self.policy.fusion_conv.parameters(), 'lr': lr_actor},
-                {'params': self.policy.fc_actor.parameters(), 'lr': lr_actor},
-                {'params': self.policy.fc_critic.parameters(), 'lr': lr_critic}
-            ])
-            
-            # Copy policy for old policy
-            self.policy_old = TwoPathActorCritic(
-                num_actions=action_dim, 
-                width=width, 
-                height=height, 
-                has_continuous_action_space=has_continuous_action_space, 
-                action_std_init=action_std_init
-            ).to(device)
-        else:
-            print("Using CNNActorCritic (single-path architecture)")
-            self.policy = CNNActorCritic(
-                num_channels=state_channels, 
-                num_actions=action_dim, 
-                width=width, 
-                height=height, 
-                has_continuous_action_space=has_continuous_action_space, 
-                action_std_init=action_std_init
-            ).to(device)
-            
-            self.optimizer = optim.Adam([
-                {'params': self.policy.conv1.parameters(), 'lr': lr_actor},
-                {'params': self.policy.bn1.parameters(), 'lr': lr_actor},
-                {'params': self.policy.conv2.parameters(), 'lr': lr_actor},
-                {'params': self.policy.bn2.parameters(), 'lr': lr_actor},
-                {'params': self.policy.conv3.parameters(), 'lr': lr_actor},
-                {'params': self.policy.bn3.parameters(), 'lr': lr_actor},
-                {'params': self.policy.fc_actor.parameters(), 'lr': lr_actor},
-                {'params': self.policy.fc_critic.parameters(), 'lr': lr_critic}
-            ])
-            
-            # Copy policy for old policy
-            self.policy_old = CNNActorCritic(
-                num_channels=state_channels, 
-                num_actions=action_dim, 
-                width=width, 
-                height=height, 
-                has_continuous_action_space=has_continuous_action_space, 
-                action_std_init=action_std_init
-            ).to(device)
+        model_class = TwoPathActorCritic if self.use_two_path else CNNActorCritic
+        model_kwargs = dict(
+            num_actions=self.action_dim,
+            width=self.height,
+            height=self.width,
+            has_continuous_action_space=self.has_continuous_action_space,
+            action_std_init=action_std_init,
+        )
+        if model_class is CNNActorCritic:
+            model_kwargs["num_channels"] = self.state_channels
+        architecture_name = "TwoPathActorCritic" if self.use_two_path else "CNNActorCritic"
+        print(f"Using fully convolutional {architecture_name}")
+        self.policy = model_class(**model_kwargs).to(self.device)
+        self.policy_old = model_class(**model_kwargs).to(self.device)
 
+        if self.use_two_path:
+            actor_parameters = list(self.policy.density_encoder.parameters())
+            actor_parameters += list(self.policy.bc_encoder.parameters())
+            actor_parameters += list(self.policy.fusion_conv.parameters())
+        else:
+            actor_parameters = list(self.policy.encoder.parameters())
+        actor_parameters += list(self.policy.spatial_context.parameters())
+        actor_parameters += list(self.policy.actor_head.parameters())
+        critic_parameters = list(self.policy.critic_head.parameters())
+        self.optimizer = optim.Adam(
+            (
+                {"params": actor_parameters, "lr": lr_actor},
+                {"params": critic_parameters, "lr": lr_critic},
+            )
+        )
         self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=1000, gamma=0.95)
         self.policy_old.load_state_dict(self.policy.state_dict())
-        
-        self.MseLoss = nn.MSELoss()
-        if device.type == 'cuda':
-            self.scaler = amp.GradScaler()
-        else:
-            self.scaler = None
+        self.policy_old.eval()
+        self.value_loss = nn.MSELoss()
+        self.scaler = torch.amp.GradScaler(
+            "cuda", enabled=self.device.type == "cuda"
+        )
 
-        # Metrics
         self.actor_losses = []
         self.critic_losses = []
         self.entropies = []
         self.grad_norms = []
-        self.rewards = []
-        self.advantages = []
 
     def set_action_std(self, new_action_std):
-        if self.has_continuous_action_space:
-            self.policy.action_var = torch.full((self.policy.action_var.size(0),), new_action_std ** 2).to(device)
-            self.policy_old.action_var = torch.full((self.policy_old.action_var.size(0),), new_action_std ** 2).to(device)
-        else:
-            print("WARNING: Calling PPO::set_action_std() on discrete action space policy")
+        if not self.has_continuous_action_space:
+            raise RuntimeError("action standard deviation only applies to continuous policies")
+        self.policy.set_action_std(new_action_std)
+        self.policy_old.set_action_std(new_action_std)
 
     def decay_action_std(self, action_std_decay_rate, min_action_std):
-        if self.has_continuous_action_space:
-            new_action_std = max(self.policy.action_var.sqrt().mean().item() - action_std_decay_rate, min_action_std)
-            self.set_action_std(new_action_std)
-            print(f"Decayed action std to {new_action_std}")
-        else:
-            print("WARNING: Calling PPO::decay_action_std() on discrete action space policy")
+        if not self.has_continuous_action_space:
+            raise RuntimeError("action standard deviation only applies to continuous policies")
+        new_std = max(
+            self.policy.action_std.item() - action_std_decay_rate, min_action_std
+        )
+        self.set_action_std(new_std)
+        return new_std
 
-    def select_action(self, states):
-        """
-        Select actions using the old policy.
-        
-        Args:
-            states (torch.Tensor): Tensor of shape [num_envs, channels, width, height]
-        
-        Returns:
-            Tuple: (actions, logprobs, state_values)
-        """
-        self.policy_old.eval()  # Disable dropout, use running BatchNorm stats for inference
+    def select_action(self, states, deterministic=False):
+        self.policy_old.eval()
+        states = states.to(self.device, dtype=torch.float32)
         with torch.no_grad():
-            actions, logprobs, state_values = self.policy_old.act(states)
-        return actions, logprobs, state_values
+            return self.policy_old.act(states, deterministic=deterministic)
 
-    def compute_gae(self, rewards, state_values, is_terminals, gamma=0.99, gae_lambda=0.95):
-        """
-        Compute Generalized Advantage Estimation (GAE).
-        
-        Args:
-            rewards (np.ndarray): Rewards array of shape [ptr, num_envs]
-            state_values (np.ndarray): State values array of shape [ptr, num_envs]
-            is_terminals (np.ndarray): Terminal flags array of shape [ptr, num_envs]
-            gamma (float): Discount factor
-            gae_lambda (float): GAE lambda parameter
-        
-        Returns:
-            Tuple[np.ndarray, np.ndarray]: Returns and advantages arrays
-        """
-        returns = np.zeros_like(rewards)
-        advantages = np.zeros_like(rewards)
-        last_advantage = np.zeros(self.num_envs)
+    def estimate_values(self, states):
+        self.policy_old.eval()
+        states = states.to(self.device, dtype=torch.float32)
+        with torch.no_grad():
+            return self.policy_old.value(states)
 
-        for step in reversed(range(self.buffer.ptr)):
-            mask = 1.0 - is_terminals[step].astype(float)
-            if step + 1 < self.buffer.ptr:
-                next_state_value = state_values[step + 1]
-            else:
-                next_state_value = np.zeros(self.num_envs)
-            delta = rewards[step] + gamma * next_state_value * mask - state_values[step]
-            last_advantage = delta + gamma * gae_lambda * mask * last_advantage
+    def compute_gae(
+        self,
+        rewards,
+        state_values,
+        is_terminals,
+        last_state_values=None,
+        gamma=None,
+        gae_lambda=None,
+    ):
+        """Compute GAE and bootstrap non-terminal rollout boundaries."""
+        rewards = torch.as_tensor(rewards, dtype=torch.float32, device="cpu")
+        state_values = torch.as_tensor(state_values, dtype=torch.float32, device="cpu")
+        is_terminals = torch.as_tensor(is_terminals, dtype=torch.bool, device="cpu")
+        if rewards.ndim != 2 or rewards.shape != state_values.shape:
+            raise ValueError("rewards and state_values must have shape (steps, num_envs)")
+        if is_terminals.shape != rewards.shape:
+            raise ValueError("terminal flags must match rewards")
+        if rewards.shape[1] != self.num_envs:
+            raise ValueError("rollout num_envs does not match PPO configuration")
+        if last_state_values is None:
+            last_state_values = torch.zeros(self.num_envs)
+        last_state_values = torch.as_tensor(
+            last_state_values, dtype=torch.float32, device="cpu"
+        ).reshape(self.num_envs)
+        gamma = self.gamma if gamma is None else gamma
+        gae_lambda = self.gae_lambda if gae_lambda is None else gae_lambda
+
+        advantages = torch.zeros_like(rewards)
+        last_advantage = torch.zeros(self.num_envs)
+        for step in reversed(range(rewards.shape[0])):
+            next_value = (
+                last_state_values
+                if step == rewards.shape[0] - 1
+                else state_values[step + 1]
+            )
+            non_terminal = (~is_terminals[step]).float()
+            delta = (
+                rewards[step]
+                + gamma * next_value * non_terminal
+                - state_values[step]
+            )
+            last_advantage = (
+                delta + gamma * gae_lambda * non_terminal * last_advantage
+            )
             advantages[step] = last_advantage
-            returns[step] = advantages[step] + state_values[step]
-        
-        returns = torch.tensor(returns, dtype=torch.float32).to(device)
-        advantages = torch.tensor(advantages, dtype=torch.float32).to(device)
+        returns = advantages + state_values
         return returns, advantages
 
-    def update(self):
-        """
-        Update the policy using the collected rollout buffer.
-        """
-        # Convert buffer to numpy for GAE
-        rewards = self.buffer.rewards[:self.buffer.ptr].cpu().numpy()  # Shape: [ptr, num_envs]
-        state_values = self.buffer.state_values[:self.buffer.ptr].cpu().numpy()  # Shape: [ptr, num_envs]
-        is_terminals = self.buffer.is_terminals[:self.buffer.ptr].cpu().numpy()  # Shape: [ptr, num_envs]
+    def update(self, last_state_values=None):
+        """Run a minibatched PPO update and clear the rollout buffer."""
+        if self.buffer.ptr == 0:
+            raise RuntimeError("cannot update PPO with an empty rollout")
+        rollout_length = self.buffer.ptr
+        rewards = self.buffer.rewards[:rollout_length]
+        state_values = self.buffer.state_values[:rollout_length]
+        terminals = self.buffer.is_terminals[:rollout_length]
+        returns, advantages = self.compute_gae(
+            rewards, state_values, terminals, last_state_values=last_state_values
+        )
 
-        # Compute GAE
-        returns, advantages = self.compute_gae(rewards, state_values, is_terminals, self.gamma, self.gae_lambda)
+        states = self.buffer.states[:rollout_length].reshape(
+            -1, self.state_channels, self.height, self.width
+        )
+        if self.has_continuous_action_space:
+            actions = self.buffer.actions[:rollout_length].reshape(-1, self.action_dim)
+        else:
+            actions = self.buffer.actions[:rollout_length].reshape(-1)
+        old_logprobs = self.buffer.logprobs[:rollout_length].reshape(-1)
+        returns = returns.reshape(-1)
+        advantages = advantages.reshape(-1)
+        advantages = (advantages - advantages.mean()) / (
+            advantages.std(unbiased=False) + 1e-8
+        )
 
-        # Flatten the buffer
-        states = self.buffer.states[:self.buffer.ptr].reshape(-1, self.state_channels, self.width, self.height).to(device)  # [ptr*num_envs, channels, W, H]
-        actions = self.buffer.actions[:self.buffer.ptr].reshape(-1).to(device)  # [ptr*num_envs]
-        logprobs = self.buffer.logprobs[:self.buffer.ptr].reshape(-1).to(device)  # [ptr*num_envs]
-        returns = returns.reshape(-1)  # [ptr*num_envs]
-        advantages = advantages.reshape(-1)  # [ptr*num_envs]
+        num_samples = states.shape[0]
+        batch_size = min(self.minibatch_size, num_samples)
+        actor_epoch_losses = []
+        critic_epoch_losses = []
+        entropy_values = []
+        gradient_norms = []
+        self.policy.train()
 
-        # Normalize advantages
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        for _ in range(self.K_epochs):
+            permutation = torch.randperm(num_samples)
+            for start in range(0, num_samples, batch_size):
+                indices = permutation[start : start + batch_size]
+                batch_states = states[indices].to(self.device)
+                batch_actions = actions[indices].to(self.device)
+                batch_old_logprobs = old_logprobs[indices].to(self.device)
+                batch_returns = returns[indices].to(self.device)
+                batch_advantages = advantages[indices].to(self.device)
 
-        for epoch in range(self.K_epochs):
-            with amp.autocast(device_type=device.type, enabled=(device.type == 'cuda')):
-                logprobs_new, state_values_new, dist_entropy = self.policy.evaluate(states, actions)
-                state_values_new = state_values_new.view(-1)
+                with torch.autocast(
+                    device_type=self.device.type, enabled=self.device.type == "cuda"
+                ):
+                    new_logprobs, new_values, entropy = self.policy.evaluate(
+                        batch_states, batch_actions
+                    )
+                    ratios = torch.exp(new_logprobs - batch_old_logprobs)
+                    surrogate_1 = ratios * batch_advantages
+                    surrogate_2 = torch.clamp(
+                        ratios, 1 - self.eps_clip, 1 + self.eps_clip
+                    ) * batch_advantages
+                    actor_loss = -torch.min(surrogate_1, surrogate_2).mean()
+                    critic_loss = self.value_loss(new_values, batch_returns)
+                    entropy_mean = entropy.mean()
+                    loss = (
+                        actor_loss
+                        + self.value_coef * critic_loss
+                        - self.entropy_coef * entropy_mean
+                    )
 
-                ratios = torch.exp(logprobs_new - logprobs)
-                surr1 = ratios * advantages
-                surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
-
-                loss_actor = -torch.min(surr1, surr2).mean()
-                loss_critic = self.MseLoss(state_values_new, returns).mean()
-                loss_entropy = -dist_entropy.mean()
-
-                loss = loss_actor + loss_critic + 0.1 * loss_entropy
-
-            self.optimizer.zero_grad()
-            if self.scaler:
+                self.optimizer.zero_grad(set_to_none=True)
                 self.scaler.scale(loss).backward()
-                # Gradient clipping
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=0.5)
+                gradient_norm = torch.nn.utils.clip_grad_norm_(
+                    self.policy.parameters(), self.max_grad_norm
+                )
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
-            else:
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=0.5)
-                self.optimizer.step()
 
-            # Logging
-            self.actor_losses.append(loss_actor.item())
-            self.critic_losses.append(loss_critic.item())
-            self.entropies.append(dist_entropy.mean().item())
+                actor_epoch_losses.append(float(actor_loss.detach().cpu()))
+                critic_epoch_losses.append(float(critic_loss.detach().cpu()))
+                entropy_values.append(float(entropy_mean.detach().cpu()))
+                gradient_norms.append(float(gradient_norm.detach().cpu()))
 
-        # Update the old policy
+        metrics = {
+            "actor_loss": sum(actor_epoch_losses) / len(actor_epoch_losses),
+            "critic_loss": sum(critic_epoch_losses) / len(critic_epoch_losses),
+            "entropy": sum(entropy_values) / len(entropy_values),
+            "grad_norm": sum(gradient_norms) / len(gradient_norms),
+            "rollout_steps": rollout_length,
+            "samples": num_samples,
+        }
+        self.actor_losses.append(metrics["actor_loss"])
+        self.critic_losses.append(metrics["critic_loss"])
+        self.entropies.append(metrics["entropy"])
+        self.grad_norms.append(metrics["grad_norm"])
+
         self.policy_old.load_state_dict(self.policy.state_dict())
+        self.policy_old.eval()
         self.buffer.clear()
         self.scheduler.step()
+        return metrics
 
     def save(self, checkpoint_path):
-        torch.save({
-            'policy_state_dict': self.policy_old.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-        }, checkpoint_path)
+        torch.save(
+            {
+                "policy_state_dict": self.policy_old.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "scheduler_state_dict": self.scheduler.state_dict(),
+                "architecture": "two_path" if self.use_two_path else "single_path",
+                "observation_shape": (self.state_channels, self.height, self.width),
+                "action_dim": self.action_dim,
+            },
+            checkpoint_path,
+        )
 
     def load(self, checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        self.policy_old.load_state_dict(checkpoint['policy_state_dict'])
-        self.policy.load_state_dict(checkpoint['policy_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        checkpoint = torch.load(
+            checkpoint_path, map_location=self.device, weights_only=True
+        )
+        self.policy_old.load_state_dict(checkpoint["policy_state_dict"])
+        self.policy.load_state_dict(checkpoint["policy_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if "scheduler_state_dict" in checkpoint:
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        self.policy_old.eval()
 
     def plot_metrics(self, save_path=None):
-        epochs = range(1, len(self.actor_losses) + 1)
-
-        plt.figure(figsize=(20, 12))
-
-        plt.subplot(2, 2, 1)
-        plt.plot(epochs, self.actor_losses, label='Actor Loss')
-        plt.xlabel('Update Steps')
-        plt.ylabel('Loss')
-        plt.title('Actor Loss')
-        plt.legend()
-
-        plt.subplot(2, 2, 2)
-        plt.plot(epochs, self.critic_losses, label='Critic Loss')
-        plt.xlabel('Update Steps')
-        plt.ylabel('Loss')
-        plt.title('Critic Loss')
-        plt.legend()
-
-        # Plot Entropy
-        plt.subplot(2, 2, 3)
-        plt.plot(epochs, self.entropies, label='Entropy', color='green')
-        plt.xlabel('Update Steps')
-        plt.ylabel('Entropy')
-        plt.title('Policy Entropy')
-        plt.legend()
-
-        # Placeholder for Gradient Norms (if implemented)
-        # plt.subplot(2, 2, 4)
-        # plt.plot(epochs, self.grad_norms, label='Gradient Norm', color='red')
-        # plt.xlabel('Update Steps')
-        # plt.ylabel('Gradient Norm')
-        # plt.title('Gradient Norms')
-        # plt.legend()
-
-        plt.tight_layout()
+        updates = range(1, len(self.actor_losses) + 1)
+        figure, axes = plt.subplots(2, 2, figsize=(16, 10))
+        axes[0, 0].plot(updates, self.actor_losses)
+        axes[0, 0].set_title("Actor loss")
+        axes[0, 1].plot(updates, self.critic_losses)
+        axes[0, 1].set_title("Critic loss")
+        axes[1, 0].plot(updates, self.entropies)
+        axes[1, 0].set_title("Policy entropy")
+        axes[1, 1].plot(updates, self.grad_norms)
+        axes[1, 1].set_title("Gradient norm")
+        for axis in axes.flat:
+            axis.set_xlabel("PPO update")
+            axis.grid(alpha=0.25)
+        figure.tight_layout()
         if save_path:
-            plt.savefig(save_path)
+            figure.savefig(save_path)
         plt.show()
