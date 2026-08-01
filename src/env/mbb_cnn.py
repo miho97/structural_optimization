@@ -512,24 +512,10 @@ class BeamOptimizationEnv(gym.Env):
         grid = self.density_field()
         plt.figure(figsize=(6, 6))
         image = plt.imshow(
-            grid, cmap="gray_r", interpolation="nearest", vmin=0, vmax=1
+            grid, cmap="viridis", interpolation="nearest", vmin=0, vmax=1
         )
         colorbar = plt.colorbar(image)
         colorbar.set_label("Density (0 = void, 1 = solid)")
-        if max(self.width, self.height) <= 12:
-            for row in range(self.height):
-                for col in range(self.width):
-                    density = grid[row, col]
-                    text_color = "white" if density > 0.55 else "black"
-                    plt.text(
-                        col,
-                        row,
-                        f"{density:.2f}",
-                        ha="center",
-                        va="center",
-                        color=text_color,
-                        fontsize=8,
-                    )
         plt.title(
             f"Step: {self.current_step} | Reward: {self.reward:.3f} | "
             f"C/C0: {self.current_compliance / self.base_compliance_value:.3f} | "
