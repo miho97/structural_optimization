@@ -68,7 +68,7 @@ class BeamOptimizationEnvironmentTests(unittest.TestCase):
             custom_forces=forces,
         )
         state, _ = env.reset()
-        self.assertEqual(state.shape, (5, height + 1, width + 1))
+        self.assertEqual(state.shape, (6, height + 1, width + 1))
         self.assertEqual(state[1, 1, 2], 1)  # normal_x at image[y, x]
         self.assertEqual(state[2, 0, 0], 1)  # normal_y at image[y, x]
         self.assertEqual(state[4, 2, 3], -1)  # force_y at image[y, x]
@@ -138,7 +138,7 @@ class BeamOptimizationEnvironmentTests(unittest.TestCase):
         self.assertFalse(repeated_info["action_was_valid"])
         self.assertEqual(repeated_info["reward_action"], -0.05)
 
-    def test_completed_episode_enforces_the_material_budget(self):
+    def test_construction_enforces_the_material_budget(self):
         env = BeamOptimizationEnv(6, 6, density=0.4, beam_type=1)
         selected_cells = set()
         final_info = None
@@ -149,18 +149,68 @@ class BeamOptimizationEnvironmentTests(unittest.TestCase):
             action = int(valid_actions[-1])
             selected_cells.add(action % (env.width * env.height))
             _, _, terminated, _, final_info = env.step(action)
-            self.assertEqual(terminated, step == env.width * env.height - 1)
+            self.assertFalse(terminated)
 
         self.assertEqual(len(selected_cells), env.width * env.height)
         self.assertEqual(final_info["solid_cells"], env.solid_cell_budget)
         self.assertEqual(final_info["undecided_cells"], 0)
-        self.assertEqual(np.count_nonzero(env.valid_action_mask()), 0)
+        self.assertEqual(env.phase, "refinement_remove")
+        mask = env.valid_action_mask()
+        self.assertEqual(np.count_nonzero(mask), env.solid_cell_budget)
+        self.assertFalse(bool(mask[env.width * env.height :].any()))
         expected_volume = (
             env.solid_cell_budget * env.maximum_density
             + (env.width * env.height - env.solid_cell_budget)
             * env.minimum_density
         ) / (env.width * env.height)
         self.assertAlmostEqual(final_info["volume_fraction"], expected_volume, places=7)
+
+    def test_refinement_swaps_preserve_material_and_finish_at_108_steps(self):
+        env = BeamOptimizationEnv(6, 6, density=0.4, beam_type=1)
+        total_cells = env.width * env.height
+
+        for _ in range(total_cells):
+            action = int(np.flatnonzero(env.valid_action_mask())[-1])
+            _, _, terminated, _, _ = env.step(action)
+            self.assertFalse(terminated)
+
+        completed_design_objective = env.previous_objective
+        remove_action = int(np.flatnonzero(env.valid_action_mask())[0])
+        removed_cell = remove_action % total_cells
+        _, remove_reward, terminated, _, remove_info = env.step(remove_action)
+        self.assertFalse(terminated)
+        self.assertEqual(remove_reward, 0.0)
+        self.assertEqual(remove_info["phase"], "refinement_remove")
+        self.assertEqual(remove_info["next_phase"], "refinement_add")
+        self.assertEqual(remove_info["pending_removal_cell"], removed_cell)
+        self.assertEqual(remove_info["solid_cells"], env.solid_cell_budget - 1)
+        self.assertEqual(env.state[5].sum().item(), 1.0)
+
+        add_mask = env.valid_action_mask()
+        self.assertFalse(bool(add_mask[:total_cells].any()))
+        self.assertFalse(bool(add_mask[total_cells + removed_cell]))
+        add_action = int(np.flatnonzero(add_mask)[0])
+        _, add_reward, terminated, _, add_info = env.step(add_action)
+        self.assertFalse(terminated)
+        self.assertTrue(add_info["swap_completed"])
+        self.assertEqual(add_info["next_phase"], "refinement_remove")
+        self.assertEqual(add_info["solid_cells"], env.solid_cell_budget)
+        self.assertEqual(env.state[5].sum().item(), 0.0)
+        self.assertAlmostEqual(
+            add_reward,
+            completed_design_objective - add_info["objective_after"],
+            places=8,
+        )
+
+        while not terminated:
+            action = int(np.flatnonzero(env.valid_action_mask())[0])
+            _, _, terminated, _, final_info = env.step(action)
+
+        self.assertEqual(env.current_step, 3 * total_cells)
+        self.assertEqual(env.completed_refinement_swaps, total_cells)
+        self.assertEqual(final_info["solid_cells"], env.solid_cell_budget)
+        self.assertEqual(final_info["next_phase"], "complete")
+        self.assertEqual(np.count_nonzero(env.valid_action_mask()), 0)
 
     def test_baseline_compliance_reward_is_zero_and_decade_scaled(self):
         env = BeamOptimizationEnv(4, 3, density=0.4, beam_type=1)
@@ -182,7 +232,7 @@ class BeamOptimizationEnvironmentTests(unittest.TestCase):
         for beam_type in range(1, 10):
             env = BeamOptimizationEnv(3, 2, density=0.4, beam_type=beam_type)
             state, _ = env.reset(seed=beam_type)
-            self.assertEqual(state.shape, (5, 3, 4), beam_type)
+            self.assertEqual(state.shape, (6, 3, 4), beam_type)
             self.assertTrue(env.observation_space.contains(state), beam_type)
 
 

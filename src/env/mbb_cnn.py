@@ -109,18 +109,25 @@ class BeamOptimizationEnv(gym.Env):
             )
         self.density = self.target_density
         self.optimal_density = self.target_density
-        # Kept as an accepted legacy argument. Actions now make an explicit
-        # void/solid assignment, so their effect is independent of ordering.
+        # Kept as an accepted legacy argument. Construction actions make an
+        # explicit void/solid assignment, so their effect is independent of
+        # ordering. Refinement actions exchange one solid and one void cell.
         self.step_size_initial = float(step_size)
         total_cells = self.width * self.height
         if max_steps is not None and int(max_steps) < total_cells:
             raise ValueError("max_steps must allow one assignment per physical cell")
-        # Longer legacy horizons cannot add useful work after every cell has
-        # been assigned, so the effective horizon is exactly the cell count.
-        self.max_steps = total_cells
+        requested_max_steps = 3 * total_cells if max_steps is None else int(max_steps)
+        if (requested_max_steps - total_cells) % 2:
+            raise ValueError(
+                "steps after construction must come in remove/add refinement pairs"
+            )
+        self.max_steps = requested_max_steps
+        self.max_refinement_swaps = (self.max_steps - total_cells) // 2
 
         self.action_space = gym.spaces.Discrete(2 * self.width * self.height)
-        observation_shape = (5, self.height + 1, self.width + 1)
+        # Channels: density, two support components, two force components,
+        # and a one-hot marker for the solid selected by a pending swap.
+        observation_shape = (6, self.height + 1, self.width + 1)
         obs_low = np.zeros(observation_shape, dtype=np.float32)
         obs_high = np.ones(observation_shape, dtype=np.float32)
         obs_low[3:5] = -1.0
@@ -203,7 +210,7 @@ class BeamOptimizationEnv(gym.Env):
         self.base_compliance = {self.beam_type: self.base_compliance_value}
 
     def construct_cnn_state(self, densities, normals=None, forces=None):
-        """Build a ``(5, height+1, width+1)`` observation."""
+        """Build a ``(6, height+1, width+1)`` observation."""
         densities = torch.as_tensor(densities, dtype=torch.float32, device=self.device)
         if densities.numel() != self.width * self.height:
             raise ValueError("density tensor has the wrong number of elements")
@@ -215,6 +222,7 @@ class BeamOptimizationEnv(gym.Env):
         # FEM nodal arrays are [x, y, dof]; image channels are [y, x].
         normals_yx = normals.reshape(self.width + 1, self.height + 1, 2).permute(1, 0, 2)
         forces_yx = forces.reshape(self.width + 1, self.height + 1, 2).permute(1, 0, 2)
+        pending_removal = torch.zeros_like(densities_padded)
         return torch.stack(
             (
                 densities_padded,
@@ -222,6 +230,7 @@ class BeamOptimizationEnv(gym.Env):
                 normals_yx[..., 1],
                 forces_yx[..., 0],
                 forces_yx[..., 1],
+                pending_removal,
             ),
             dim=0,
         )
@@ -245,6 +254,10 @@ class BeamOptimizationEnv(gym.Env):
             self.args, x=densities.numpy(), verbose=False
         )
         self.current_step = 0
+        self.pending_removal_cell = None
+        self.completed_refinement_swaps = 0
+        self._swap_objective_before = None
+        self._swap_compliance_before = None
         self.current_compliance = float(initial_compliance)
         self.previous_compliance = float(initial_compliance)
         self.current_constraint = float(volume_fraction)
@@ -264,12 +277,12 @@ class BeamOptimizationEnv(gym.Env):
         return self.state[0, : self.height, : self.width].numpy().copy()
 
     def valid_action_mask(self):
-        """Return undecided void/solid assignments in categorical order.
+        """Return valid construction or refinement actions.
 
         A cell starts at the target density and is assigned exactly once to a
-        density bound. Masking both directions afterward makes the episode
-        acyclic and prevents deterministic policies from editing one cell in
-        a loop while the rest of the structure stays untouched.
+        density bound. Once construction is complete, actions alternate
+        between removing a solid cell and filling a different void cell. Each
+        completed refinement pair therefore preserves the material budget.
         """
         densities = self.density_field().reshape(-1)
         tolerance = 1e-6
@@ -282,15 +295,45 @@ class BeamOptimizationEnv(gym.Env):
         )
         solid_budget = self.solid_cell_budget
 
-        # A solid assignment is possible until the material budget is full.
-        # A void assignment is possible only if the remaining undecided cells
-        # can still fill that budget. Thus every completed design is feasible
-        # by construction instead of asking PPO to learn not to cheat.
-        allow_solid = solid_count < solid_budget
-        allow_void = solid_count + undecided_count - 1 >= solid_budget
-        can_assign_void = undecided & allow_void
-        can_assign_solid = undecided & allow_solid
+        if undecided_count:
+            # A solid assignment is possible until the material budget is
+            # full. A void assignment is possible only if the remaining
+            # undecided cells can still fill that budget.
+            allow_solid = solid_count < solid_budget
+            allow_void = solid_count + undecided_count - 1 >= solid_budget
+            can_assign_void = undecided & allow_void
+            can_assign_solid = undecided & allow_solid
+        elif self.pending_removal_cell is not None:
+            # The first half of a swap has removed one solid cell. Only adding
+            # a different void cell can complete the material-preserving pair.
+            can_assign_void = np.zeros_like(undecided)
+            can_assign_solid = densities <= self.minimum_density + tolerance
+            can_assign_solid[self.pending_removal_cell] = False
+        elif self.current_step < self.max_steps and 0 < solid_budget < densities.size:
+            # A feasible completed design starts a new refinement pair by
+            # selecting one of its solid cells for removal.
+            can_assign_void = densities >= self.maximum_density - tolerance
+            can_assign_solid = np.zeros_like(undecided)
+        else:
+            can_assign_void = np.zeros_like(undecided)
+            can_assign_solid = np.zeros_like(undecided)
         return np.concatenate((can_assign_void, can_assign_solid))
+
+    @property
+    def phase(self):
+        """Current episode phase, exposed for diagnostics and tests."""
+        densities = self.density_field()
+        tolerance = 1e-6
+        if np.any(
+            (densities > self.minimum_density + tolerance)
+            & (densities < self.maximum_density - tolerance)
+        ):
+            return "construction"
+        if self.pending_removal_cell is not None:
+            return "refinement_add"
+        if np.any(self.valid_action_mask()):
+            return "refinement_remove"
+        return "complete"
 
     @property
     def solid_cell_budget(self):
@@ -422,42 +465,69 @@ class BeamOptimizationEnv(gym.Env):
         return self._objective_terms(densities, compliance, volume_fraction)
 
     def step(self, action):
-        """Increase or decrease one physical cell and evaluate the result."""
+        """Assign a cell during construction or perform half of a refinement swap."""
         action = int(action)
         total_cells = self.width * self.height
         if not self.action_space.contains(action):
             raise ValueError(f"invalid action {action}; expected [0, {2 * total_cells})")
 
+        phase_before = self.phase
         cell = action % total_cells
         row, col = divmod(cell, self.width)
         direction = "increase" if action >= total_cells else "decrease"
-
-        compliance_before = self.previous_compliance
-        old_density = float(self.state[0, row, col])
         action_was_valid = bool(self.valid_action_mask()[action])
+        old_density = float(self.state[0, row, col])
+        previous_objective = self.previous_objective
+        compliance_before = self.previous_compliance
+        swap_completed = False
+
         if action_was_valid:
             new_density = (
                 self.maximum_density
                 if direction == "increase"
                 else self.minimum_density
             )
+            self.state[0, row, col] = new_density
+            if phase_before == "refinement_remove":
+                self.pending_removal_cell = cell
+                self.state[5, row, col] = 1.0
+                self._swap_objective_before = self.previous_objective
+                self._swap_compliance_before = self.previous_compliance
+            elif phase_before == "refinement_add":
+                self.state[5].zero_()
+                self.pending_removal_cell = None
+                self.completed_refinement_swaps += 1
+                swap_completed = True
         else:
             new_density = old_density
+
         self.step_size = abs(new_density - old_density)
         changed = not np.isclose(new_density, old_density)
-        self.state[0, row, col] = new_density
-        # A successful edit is not an achievement by itself. The previous
-        # +0.05 paid the policy merely to push cells to a bound.
+        # A successful edit is not an achievement by itself. Invalid masked
+        # actions retain a small defensive penalty for direct API callers.
         reward_action = 0.0 if changed else -0.05
         self.current_step += 1
 
-        previous_objective = self.previous_objective
         _, reward_info = self.calculate_reward()
         self.current_objective = reward_info["objective_cost"]
-        main_reward = previous_objective - self.current_objective
-        self.previous_objective = self.current_objective
+        if not action_was_valid or phase_before == "refinement_remove":
+            # A removal is only a proposal. Score the complete topology after
+            # its paired addition instead of rewarding an under-budget state.
+            main_reward = 0.0
+        elif swap_completed:
+            previous_objective = self._swap_objective_before
+            compliance_before = self._swap_compliance_before
+            main_reward = previous_objective - self.current_objective
+            self.previous_objective = self.current_objective
+            self.previous_compliance = self.current_compliance
+            self._swap_objective_before = None
+            self._swap_compliance_before = None
+        else:
+            main_reward = previous_objective - self.current_objective
+            self.previous_objective = self.current_objective
+            self.previous_compliance = self.current_compliance
+
         compliance_after = self.current_compliance
-        self.previous_compliance = compliance_after
         if (
             np.isfinite(compliance_before)
             and np.isfinite(compliance_after)
@@ -471,16 +541,24 @@ class BeamOptimizationEnv(gym.Env):
             compliance_improvement = 0.0
 
         # Potential-difference shaping pays only for improving the actual
-        # constrained objective. It does not repeatedly collect a state bonus
-        # for removing early in the episode.
+        # constrained objective. A refinement removal returns zero until its
+        # material-preserving addition completes the pair.
         reward = float(np.clip(reward_action + main_reward, -10.0, 10.0))
         compliance_ratio = reward_info["compliance_ratio"]
-        is_new_best = self.current_objective < self.best_objective
+        completed_design = (
+            reward_info["undecided_cells"] == 0
+            and self.pending_removal_cell is None
+            and reward_info["solid_cells"] == self.solid_cell_budget
+        )
+        is_new_best = completed_design and self.current_objective < self.best_objective
         if is_new_best:
             self.best_objective = self.current_objective
             self.best_compliance_ratio = compliance_ratio
         self.reward = reward
-        terminated = self.current_step >= self.max_steps or not self.valid_action_mask().any()
+        terminated = (
+            (self.current_step >= self.max_steps and self.pending_removal_cell is None)
+            or not self.valid_action_mask().any()
+        )
         info = {
             **reward_info,
             "compliance_before": float(compliance_before),
@@ -498,6 +576,13 @@ class BeamOptimizationEnv(gym.Env):
             "best_compliance_ratio": float(self.best_compliance_ratio),
             "best_objective": float(self.best_objective),
             "is_new_best": bool(is_new_best),
+            "phase": phase_before,
+            "next_phase": self.phase,
+            "swap_completed": swap_completed,
+            "pending_removal_cell": (
+                -1 if self.pending_removal_cell is None else self.pending_removal_cell
+            ),
+            "completed_refinement_swaps": self.completed_refinement_swaps,
             "direction": direction,
             "assignment": "solid" if direction == "increase" else "void",
             "cell": int(cell),

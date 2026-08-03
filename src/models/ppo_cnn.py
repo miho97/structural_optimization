@@ -124,6 +124,7 @@ class _SpatialActorCritic(nn.Module):
         has_continuous_action_space,
         action_std_init,
         target_density=0.4,
+        num_channels=5,
     ):
         super().__init__()
         self.num_actions = int(num_actions)
@@ -133,6 +134,7 @@ class _SpatialActorCritic(nn.Module):
         self.grid_width = self.observation_width - 1
         self.has_continuous_action_space = bool(has_continuous_action_space)
         self.target_density = float(target_density)
+        self.num_channels = int(num_channels)
         expected_actions = 2 * self.grid_height * self.grid_width
         if self.grid_height < 1 or self.grid_width < 1:
             raise ValueError("observations must include at least a 1x1 element grid plus nodes")
@@ -145,6 +147,8 @@ class _SpatialActorCritic(nn.Module):
             raise ValueError("action_std_init must be positive")
         if not 0.001 < self.target_density < 1.0:
             raise ValueError("target_density must lie strictly between 0.001 and 1")
+        if self.num_channels < 5:
+            raise ValueError("observations require density and four boundary-condition channels")
         self.register_buffer("action_std", torch.tensor(float(action_std_init)))
 
     def _finish_heads(self):
@@ -171,6 +175,10 @@ class _SpatialActorCritic(nn.Module):
     def _validate_states(self, states):
         if states.ndim != 4:
             raise ValueError("states must have shape (batch, channels, height, width)")
+        if states.shape[1] != self.num_channels:
+            raise ValueError(
+                f"expected {self.num_channels} observation channels, got {states.shape[1]}"
+            )
         if tuple(states.shape[-2:]) != (
             self.observation_height,
             self.observation_width,
@@ -198,7 +206,7 @@ class _SpatialActorCritic(nn.Module):
         return self.critic_head(pooled).squeeze(-1)
 
     def valid_action_mask(self, states):
-        """Mask both assignments for cells already decided void or solid."""
+        """Mask construction assignments and alternating refinement actions."""
         densities = states[
             :, 0, : self.grid_height, : self.grid_width
         ].flatten(start_dim=1)
@@ -215,12 +223,37 @@ class _SpatialActorCritic(nn.Module):
         solid_budget = min(max(solid_budget, 0), total_cells)
         solid_count = (densities >= 1.0 - tolerance).sum(dim=1)
 
-        allow_solid = (solid_count < solid_budget).unsqueeze(1)
-        allow_void = (
+        construction_allow_solid = (solid_count < solid_budget).unsqueeze(1)
+        construction_allow_void = (
             solid_count + undecided_count - 1 >= solid_budget
         ).unsqueeze(1)
-        can_assign_void = undecided & allow_void
-        can_assign_solid = undecided & allow_solid
+        constructing = (undecided_count > 0).unsqueeze(1)
+        can_assign_void = undecided & construction_allow_void & constructing
+        can_assign_solid = undecided & construction_allow_solid & constructing
+
+        if self.num_channels >= 6:
+            pending_removal = states[
+                :, 5, : self.grid_height, : self.grid_width
+            ].flatten(start_dim=1) > 0.5
+        else:
+            pending_removal = torch.zeros_like(undecided)
+        has_pending_removal = pending_removal.any(dim=1, keepdim=True)
+        refining = ~constructing
+
+        # With a complete binary design, first select a solid for removal.
+        can_assign_void |= (
+            refining
+            & ~has_pending_removal
+            & (densities >= 1.0 - tolerance)
+        )
+        # The pending-removal channel identifies the one void that cannot be
+        # immediately refilled, ensuring every refinement pair changes design.
+        can_assign_solid |= (
+            refining
+            & has_pending_removal
+            & (densities <= 0.001 + tolerance)
+            & ~pending_removal
+        )
         action_mask = torch.cat((can_assign_void, can_assign_solid), dim=1)
         if action_mask.shape[1] != self.num_actions:
             raise RuntimeError("density-derived action-mask size mismatch")
@@ -296,6 +329,7 @@ class CNNActorCritic(_SpatialActorCritic):
             has_continuous_action_space=has_continuous_action_space,
             action_std_init=action_std_init,
             target_density=target_density,
+            num_channels=num_channels,
         )
         self.encoder = nn.Sequential(
             nn.Conv2d(num_channels, 64, kernel_size=3, padding=1),
@@ -329,6 +363,7 @@ class TwoPathActorCritic(_SpatialActorCritic):
         action_std_init,
         target_density=0.4,
         dropout_rate=0.0,
+        num_channels=5,
     ):
         del dropout_rate
         super().__init__(
@@ -338,9 +373,11 @@ class TwoPathActorCritic(_SpatialActorCritic):
             has_continuous_action_space=has_continuous_action_space,
             action_std_init=action_std_init,
             target_density=target_density,
+            num_channels=num_channels,
         )
+        topology_channels = self.num_channels - 4
         self.density_encoder = nn.Sequential(
-            nn.Conv2d(1, 64, kernel_size=3, padding=1),
+            nn.Conv2d(topology_channels, 64, kernel_size=3, padding=1),
             nn.GroupNorm(8, 64),
             nn.ReLU(),
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
@@ -372,7 +409,8 @@ class TwoPathActorCritic(_SpatialActorCritic):
         self._finish_heads()
 
     def forward_features(self, states):
-        density_features = self.density_encoder(states[:, 0:1])
+        topology = torch.cat((states[:, 0:1], states[:, 5:]), dim=1)
+        density_features = self.density_encoder(topology)
         boundary_features = self.bc_encoder(states[:, 1:5])
         fused = self.fusion_conv(
             torch.cat((density_features, boundary_features), dim=1)
@@ -457,9 +495,8 @@ class PPO:
             has_continuous_action_space=self.has_continuous_action_space,
             action_std_init=action_std_init,
             target_density=self.target_density,
+            num_channels=self.state_channels,
         )
-        if model_class is CNNActorCritic:
-            model_kwargs["num_channels"] = self.state_channels
         architecture_name = "TwoPathActorCritic" if self.use_two_path else "CNNActorCritic"
         print(f"Using fully convolutional {architecture_name}")
         self.policy = model_class(**model_kwargs).to(self.device)

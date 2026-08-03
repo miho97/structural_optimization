@@ -89,6 +89,35 @@ class FullyConvolutionalPolicyTests(unittest.TestCase):
             float(budget_distribution.probs[:, :6].sum()), 1.0, places=6
         )
 
+    def test_policy_mask_alternates_refinement_removal_and_addition(self):
+        model = TwoPathActorCritic(
+            num_actions=12,
+            width=4,
+            height=3,
+            has_continuous_action_space=False,
+            action_std_init=0.6,
+            num_channels=6,
+        )
+        total_cells = 6
+        states = torch.zeros(1, 6, 4, 3)
+        states[:, 0, :3, :2] = 0.001
+        states[:, 0, 0, 0] = 1.0
+        states[:, 0, 0, 1] = 1.0
+
+        removal_mask = model.valid_action_mask(states)
+        expected_removals = torch.zeros_like(removal_mask)
+        expected_removals[0, 0:2] = True
+        torch.testing.assert_close(removal_mask, expected_removals)
+
+        # Cell 0 has been selected for removal and is marked in channel 5.
+        states[:, 0, 0, 0] = 0.001
+        states[:, 5, 0, 0] = 1.0
+        addition_mask = model.valid_action_mask(states)
+        self.assertFalse(bool(addition_mask[:, :total_cells].any()))
+        self.assertFalse(bool(addition_mask[0, total_cells]))
+        self.assertFalse(bool(addition_mask[0, total_cells + 1]))
+        self.assertEqual(int(addition_mask.sum()), total_cells - 2)
+
 
 class PPOCorrectnessTests(unittest.TestCase):
     def make_agent(self, num_envs=2, rollout_steps=4):
