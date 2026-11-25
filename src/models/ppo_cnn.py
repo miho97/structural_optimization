@@ -1,14 +1,22 @@
-"""Fully convolutional PPO for grid-based structural optimization."""
+"""Fully convolutional PPO for grid-based structural optimization.
+
+The policy reads the observation layout defined in ``utils.layout`` and emits
+two logits per physical cell (void, solid) plus one stop logit. Invalid
+actions are masked from the observation itself, so the mask always matches
+the environment and the network is independent of grid size and target
+volume.
+"""
 
 from __future__ import annotations
 
 import math
 
-import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.distributions import Categorical, Independent, Normal
+from torch.distributions import Categorical
+
+from utils import layout
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -24,45 +32,38 @@ class RolloutBuffer:
         channels,
         height,
         width,
-        action_dim,
+        action_dim=None,
         continuous_actions=False,
         buffer_device="cpu",
     ):
+        del action_dim
+        if continuous_actions:
+            raise ValueError("the grid environment has discrete actions only")
         if max_size < 1 or num_envs < 1:
             raise ValueError("max_size and num_envs must be positive")
         self.num_envs = int(num_envs)
         self.max_size = int(max_size)
         self.ptr = 0
         self.buffer_device = torch.device(buffer_device)
-        self.continuous_actions = bool(continuous_actions)
 
+        shape = (self.max_size, self.num_envs)
         self.states = torch.empty(
-            (max_size, num_envs, channels, height, width),
-            dtype=torch.float32,
-            device=self.buffer_device,
+            (*shape, channels, height, width), dtype=torch.float32, device=self.buffer_device
         )
-        if self.continuous_actions:
-            self.actions = torch.empty(
-                (max_size, num_envs, action_dim),
-                dtype=torch.float32,
-                device=self.buffer_device,
-            )
-        else:
-            self.actions = torch.empty(
-                (max_size, num_envs), dtype=torch.long, device=self.buffer_device
-            )
-        self.logprobs = torch.empty((max_size, num_envs), device=self.buffer_device)
-        self.rewards = torch.empty((max_size, num_envs), device=self.buffer_device)
-        self.state_values = torch.empty((max_size, num_envs), device=self.buffer_device)
-        self.is_terminals = torch.empty(
-            (max_size, num_envs), dtype=torch.bool, device=self.buffer_device
-        )
+        self.actions = torch.empty(shape, dtype=torch.long, device=self.buffer_device)
+        self.logprobs = torch.empty(shape, device=self.buffer_device)
+        self.rewards = torch.empty(shape, device=self.buffer_device)
+        self.state_values = torch.empty(shape, device=self.buffer_device)
+        self.is_terminals = torch.empty(shape, dtype=torch.bool, device=self.buffer_device)
+        # False marks a transition that must not be trained on, such as the
+        # reset step a vector environment inserts after an episode ends.
+        self.valid = torch.ones(shape, dtype=torch.bool, device=self.buffer_device)
 
     @property
     def is_full(self):
         return self.ptr == self.max_size
 
-    def store(self, states, actions, logprobs, rewards, state_values, is_terminals):
+    def store(self, states, actions, logprobs, rewards, state_values, is_terminals, valid=None):
         if self.is_full:
             raise IndexError(
                 f"rollout buffer is full ({self.max_size} steps); update PPO before storing more"
@@ -76,28 +77,44 @@ class RolloutBuffer:
         self.rewards[self.ptr].copy_(rewards.detach().to(self.buffer_device))
         self.state_values[self.ptr].copy_(state_values.detach().to(self.buffer_device))
         self.is_terminals[self.ptr].copy_(is_terminals.detach().to(self.buffer_device))
+        if valid is None:
+            self.valid[self.ptr].fill_(True)
+        else:
+            self.valid[self.ptr].copy_(
+                torch.as_tensor(valid, dtype=torch.bool).to(self.buffer_device)
+            )
         self.ptr += 1
 
     def clear(self):
         self.ptr = 0
 
 
+def _groups(channels):
+    """GroupNorm group count: 8 below 128 channels, 16 from there on."""
+    groups = 8 if channels < 128 else 16
+    while channels % groups:
+        groups //= 2
+    return max(groups, 1)
+
+
+def _conv_block(in_channels, out_channels):
+    return [
+        nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+        nn.GroupNorm(_groups(out_channels), out_channels),
+        nn.ReLU(),
+    ]
+
+
 class DilatedSpatialContext(nn.Module):
-    """Expand the actor receptive field without resolution-dependent weights."""
+    """Expand the receptive field without resolution-dependent weights."""
 
     def __init__(self, channels, dilations=(2, 4, 8, 16)):
         super().__init__()
         self.dilations = tuple(dilations)
         self.blocks = nn.ModuleList(
             nn.Sequential(
-                nn.Conv2d(
-                    channels,
-                    channels,
-                    kernel_size=3,
-                    padding=dilation,
-                    dilation=dilation,
-                ),
-                nn.GroupNorm(16, channels),
+                nn.Conv2d(channels, channels, kernel_size=3, padding=dilation, dilation=dilation),
+                nn.GroupNorm(_groups(channels), channels),
                 nn.ReLU(),
             )
             for dilation in self.dilations
@@ -105,63 +122,50 @@ class DilatedSpatialContext(nn.Module):
 
     def forward(self, features):
         for block in self.blocks:
-            # Residual propagation retains precise local information while
-            # each dilation communicates over an increasingly large radius.
+            # Residual propagation keeps precise local information while each
+            # dilation communicates over an increasingly large radius.
             features = features + block(features)
         return features
 
 
 class _SpatialActorCritic(nn.Module):
-    """Distribution/value behavior shared by both convolutional encoders."""
+    """Distribution and value behavior shared by both encoders."""
 
     feature_channels: int
 
-    def __init__(
-        self,
-        num_actions,
-        observation_height,
-        observation_width,
-        has_continuous_action_space,
-        action_std_init,
-        target_density=0.4,
-        num_channels=5,
-    ):
+    def __init__(self, num_actions, observation_height, observation_width, num_channels):
         super().__init__()
         self.num_actions = int(num_actions)
         self.observation_height = int(observation_height)
         self.observation_width = int(observation_width)
         self.grid_height = self.observation_height - 1
         self.grid_width = self.observation_width - 1
-        self.has_continuous_action_space = bool(has_continuous_action_space)
-        self.target_density = float(target_density)
         self.num_channels = int(num_channels)
-        expected_actions = 2 * self.grid_height * self.grid_width
         if self.grid_height < 1 or self.grid_width < 1:
             raise ValueError("observations must include at least a 1x1 element grid plus nodes")
+        self.num_cells = self.grid_height * self.grid_width
+        expected_actions = 2 * self.num_cells + 1
         if self.num_actions != expected_actions:
             raise ValueError(
-                f"expected {expected_actions} actions for a {self.grid_height}x{self.grid_width} "
-                f"grid, got {self.num_actions}"
+                f"expected {expected_actions} actions (void and solid per cell, plus stop) "
+                f"for a {self.grid_height}x{self.grid_width} grid, got {self.num_actions}"
             )
-        if action_std_init <= 0:
-            raise ValueError("action_std_init must be positive")
-        if not 0.001 < self.target_density < 1.0:
-            raise ValueError("target_density must lie strictly between 0.001 and 1")
-        if self.num_channels < 5:
-            raise ValueError("observations require density and four boundary-condition channels")
-        self.register_buffer("action_std", torch.tensor(float(action_std_init)))
+        if self.num_channels != layout.NUM_CHANNELS:
+            raise ValueError(
+                f"observations must have {layout.NUM_CHANNELS} channels "
+                f"(layout version {layout.LAYOUT_VERSION}), got {self.num_channels}"
+            )
 
     def _finish_heads(self):
+        pooled = 2 * self.feature_channels  # average and max pooling
         self.actor_head = nn.Conv2d(self.feature_channels, 2, kernel_size=1)
-        self.critic_pool = nn.AdaptiveAvgPool2d(1)
-        self.critic_head = nn.Sequential(
-            nn.Linear(self.feature_channels, 256),
-            nn.Tanh(),
-            nn.Linear(256, 1),
-        )
+        self.stop_head = nn.Linear(pooled, 1)
+        self.critic_head = nn.Sequential(nn.Linear(pooled, 256), nn.Tanh(), nn.Linear(256, 1))
         self.apply(self._initialize_layer)
         nn.init.orthogonal_(self.actor_head.weight, gain=0.01)
         nn.init.zeros_(self.actor_head.bias)
+        nn.init.orthogonal_(self.stop_head.weight, gain=0.01)
+        nn.init.zeros_(self.stop_head.bias)
         nn.init.orthogonal_(self.critic_head[-1].weight, gain=1.0)
         nn.init.zeros_(self.critic_head[-1].bias)
 
@@ -179,10 +183,7 @@ class _SpatialActorCritic(nn.Module):
             raise ValueError(
                 f"expected {self.num_channels} observation channels, got {states.shape[1]}"
             )
-        if tuple(states.shape[-2:]) != (
-            self.observation_height,
-            self.observation_width,
-        ):
+        if tuple(states.shape[-2:]) != (self.observation_height, self.observation_width):
             raise ValueError(
                 f"expected spatial shape {(self.observation_height, self.observation_width)}, "
                 f"got {tuple(states.shape[-2:])}"
@@ -191,98 +192,63 @@ class _SpatialActorCritic(nn.Module):
     def forward_features(self, states):
         raise NotImplementedError
 
+    def _pooled(self, features):
+        return torch.cat((features.mean(dim=(2, 3)), features.amax(dim=(2, 3))), dim=1)
+
     def action_output(self, features):
+        """Logits for ``2N`` cell actions followed by the stop action, in float32."""
         # The observation has one padded row and column for nodal channels.
         # Cropping guarantees that padded locations can never become actions.
-        output = self.actor_head(features)[
-            :, :, : self.grid_height, : self.grid_width
-        ].flatten(start_dim=1)
-        if output.shape[1] != self.num_actions:
-            raise RuntimeError("actor output/action-space mismatch")
-        return torch.tanh(output) if self.has_continuous_action_space else output
+        cells = self.actor_head(features)[:, :, : self.grid_height, : self.grid_width]
+        stop = self.stop_head(self._pooled(features))
+        return torch.cat((cells.flatten(start_dim=1), stop), dim=1).float()
 
     def value_from_features(self, features):
-        pooled = self.critic_pool(features).flatten(start_dim=1)
-        return self.critic_head(pooled).squeeze(-1)
+        return self.critic_head(self._pooled(features)).squeeze(-1).float()
+
+    def _cells(self, states, channel):
+        return states[:, channel, : self.grid_height, : self.grid_width].flatten(start_dim=1)
 
     def valid_action_mask(self, states):
-        """Mask construction assignments and alternating refinement actions."""
-        densities = states[
-            :, 0, : self.grid_height, : self.grid_width
-        ].flatten(start_dim=1)
-        tolerance = 1e-6
-        undecided = (densities > 0.001 + tolerance) & (
-            densities < 1.0 - tolerance
-        )
+        """Rebuild the environment's action mask from the observation."""
+        undecided = self._cells(states, layout.UNDECIDED) > 0.5
+        solid = self._cells(states, layout.SOLID) > 0.5
+        void = self._cells(states, layout.VOID) > 0.5
+        pending = self._cells(states, layout.PENDING) > 0.5
+        budget_left = torch.round(states[:, layout.BUDGET_LEFT, 0, 0] * self.num_cells)
+        swaps_left = states[:, layout.SWAPS_LEFT, 0, 0] > 1e-6
+
         undecided_count = undecided.sum(dim=1)
-        total_cells = self.grid_height * self.grid_width
-        continuous_budget = (
-            self.target_density * total_cells - 0.001 * total_cells
-        ) / (1.0 - 0.001)
-        solid_budget = int(round(continuous_budget))
-        solid_budget = min(max(solid_budget, 0), total_cells)
-        solid_count = (densities >= 1.0 - tolerance).sum(dim=1)
+        constructing = undecided_count > 0
+        allow_solid = constructing & (budget_left > 0)
+        allow_void = constructing & (undecided_count - 1 >= budget_left)
+        can_void = undecided & allow_void.unsqueeze(1)
+        can_solid = undecided & allow_solid.unsqueeze(1)
 
-        construction_allow_solid = (solid_count < solid_budget).unsqueeze(1)
-        construction_allow_void = (
-            solid_count + undecided_count - 1 >= solid_budget
-        ).unsqueeze(1)
-        constructing = (undecided_count > 0).unsqueeze(1)
-        can_assign_void = undecided & construction_allow_void & constructing
-        can_assign_solid = undecided & construction_allow_solid & constructing
-
-        if self.num_channels >= 6:
-            pending_removal = states[
-                :, 5, : self.grid_height, : self.grid_width
-            ].flatten(start_dim=1) > 0.5
-        else:
-            pending_removal = torch.zeros_like(undecided)
-        has_pending_removal = pending_removal.any(dim=1, keepdim=True)
-        refining = ~constructing
-
-        # With a complete binary design, first select a solid for removal.
-        can_assign_void |= (
-            refining
-            & ~has_pending_removal
-            & (densities >= 1.0 - tolerance)
-        )
-        # The pending-removal channel identifies the one void that cannot be
-        # immediately refilled, ensuring every refinement pair changes design.
-        can_assign_solid |= (
-            refining
-            & has_pending_removal
-            & (densities <= 0.001 + tolerance)
-            & ~pending_removal
-        )
-        action_mask = torch.cat((can_assign_void, can_assign_solid), dim=1)
-        if action_mask.shape[1] != self.num_actions:
-            raise RuntimeError("density-derived action-mask size mismatch")
+        has_pending = pending.any(dim=1)
+        idle = ~constructing & ~has_pending
+        swap_possible = idle & swaps_left & solid.any(dim=1) & void.any(dim=1)
+        # A finished design starts a swap by removing one of its solid cells.
+        can_void = can_void | (solid & swap_possible.unsqueeze(1))
+        # The removed cell cannot be refilled, so every swap changes the design.
+        can_solid = can_solid | (void & ~pending & (~constructing & has_pending).unsqueeze(1))
+        # Stopping is allowed whenever a finished design has no pending swap.
+        action_mask = torch.cat((can_void, can_solid, idle.unsqueeze(1)), dim=1)
         if not bool(action_mask.any(dim=1).all()):
-            raise RuntimeError("the policy was asked to act on a completed design")
+            raise RuntimeError("an observation has no valid action")
         return action_mask
 
-    def distribution(self, actor_output, states=None):
-        if self.has_continuous_action_space:
-            std = self.action_std.expand_as(actor_output)
-            return Independent(Normal(actor_output, std), 1)
-        if states is None:
-            raise ValueError("states are required to mask invalid discrete actions")
+    def distribution(self, logits, states):
         action_mask = self.valid_action_mask(states)
-        masked_logits = actor_output.masked_fill(
-            ~action_mask, torch.finfo(actor_output.dtype).min
-        )
+        masked_logits = logits.masked_fill(~action_mask, torch.finfo(logits.dtype).min)
         return Categorical(logits=masked_logits)
 
     def act(self, states, deterministic=False):
         self._validate_states(states)
         features = self.forward_features(states)
-        actor_output = self.action_output(features)
-        distribution = self.distribution(actor_output, states)
+        distribution = self.distribution(self.action_output(features), states)
         if deterministic:
-            if self.has_continuous_action_space:
-                actions = actor_output
-            else:
-                actions = distribution.probs.argmax(dim=-1)
+            actions = distribution.probs.argmax(dim=-1)
         else:
             actions = distribution.sample()
         return actions, distribution.log_prob(actions), self.value_from_features(features)
@@ -301,14 +267,14 @@ class _SpatialActorCritic(nn.Module):
         self._validate_states(states)
         return self.value_from_features(self.forward_features(states))
 
-    def set_action_std(self, new_action_std):
-        if new_action_std <= 0:
-            raise ValueError("action standard deviation must be positive")
-        self.action_std.fill_(float(new_action_std))
-
 
 class CNNActorCritic(_SpatialActorCritic):
-    """Single-path, fully convolutional actor with a pooled critic."""
+    """Single-path, fully convolutional actor with a pooled critic.
+
+    ``width`` and ``height`` keep their historical meaning in this module:
+    they are the observation's first and second spatial sizes, that is
+    ``grid_height + 1`` and ``grid_width + 1``.
+    """
 
     def __init__(
         self,
@@ -316,34 +282,24 @@ class CNNActorCritic(_SpatialActorCritic):
         num_actions,
         width,
         height,
-        has_continuous_action_space,
-        action_std_init,
-        target_density=0.4,
+        has_continuous_action_space=False,
+        action_std_init=None,
+        target_density=None,
         dropout_rate=0.0,
+        base_channels=64,
     ):
-        del dropout_rate
-        super().__init__(
-            num_actions,
-            observation_height=width,
-            observation_width=height,
-            has_continuous_action_space=has_continuous_action_space,
-            action_std_init=action_std_init,
-            target_density=target_density,
-            num_channels=num_channels,
-        )
+        del action_std_init, target_density, dropout_rate
+        if has_continuous_action_space:
+            raise ValueError("the grid environment has discrete actions only")
+        super().__init__(num_actions, width, height, num_channels)
+        hidden = 2 * base_channels
         self.encoder = nn.Sequential(
-            nn.Conv2d(num_channels, 64, kernel_size=3, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.ReLU(),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.GroupNorm(16, 128),
-            nn.ReLU(),
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),
-            nn.GroupNorm(16, 128),
-            nn.ReLU(),
+            *_conv_block(num_channels, base_channels),
+            *_conv_block(base_channels, hidden),
+            *_conv_block(hidden, hidden),
         )
-        self.feature_channels = 128
-        self.spatial_context = DilatedSpatialContext(self.feature_channels)
+        self.feature_channels = hidden
+        self.spatial_context = DilatedSpatialContext(hidden)
         self.receptive_field = 7 + 2 * sum(self.spatial_context.dilations)
         self._finish_heads()
 
@@ -352,73 +308,64 @@ class CNNActorCritic(_SpatialActorCritic):
 
 
 class TwoPathActorCritic(_SpatialActorCritic):
-    """Separate density and boundary-condition encoders with spatial fusion."""
+    """Separate topology and boundary-condition encoders with spatial fusion."""
 
     def __init__(
         self,
         num_actions,
         width,
         height,
-        has_continuous_action_space,
-        action_std_init,
-        target_density=0.4,
+        has_continuous_action_space=False,
+        action_std_init=None,
+        target_density=None,
         dropout_rate=0.0,
-        num_channels=5,
+        num_channels=layout.NUM_CHANNELS,
+        base_channels=64,
     ):
-        del dropout_rate
-        super().__init__(
-            num_actions,
-            observation_height=width,
-            observation_width=height,
-            has_continuous_action_space=has_continuous_action_space,
-            action_std_init=action_std_init,
-            target_density=target_density,
-            num_channels=num_channels,
+        del action_std_init, target_density, dropout_rate
+        if has_continuous_action_space:
+            raise ValueError("the grid environment has discrete actions only")
+        super().__init__(num_actions, width, height, num_channels)
+        hidden = 2 * base_channels
+        self.register_buffer(
+            "topology_index", torch.tensor(layout.TOPOLOGY_CHANNELS), persistent=False
         )
-        topology_channels = self.num_channels - 4
+        self.register_buffer(
+            "boundary_index", torch.tensor(layout.BOUNDARY_CHANNELS), persistent=False
+        )
         self.density_encoder = nn.Sequential(
-            nn.Conv2d(topology_channels, 64, kernel_size=3, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.ReLU(),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.GroupNorm(16, 128),
-            nn.ReLU(),
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),
-            nn.GroupNorm(16, 128),
-            nn.ReLU(),
+            *_conv_block(len(layout.TOPOLOGY_CHANNELS), base_channels),
+            *_conv_block(base_channels, hidden),
+            *_conv_block(hidden, hidden),
         )
         self.bc_encoder = nn.Sequential(
-            nn.Conv2d(4, 64, kernel_size=3, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.ReLU(),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.GroupNorm(16, 128),
-            nn.ReLU(),
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),
-            nn.GroupNorm(16, 128),
-            nn.ReLU(),
+            *_conv_block(len(layout.BOUNDARY_CHANNELS), base_channels),
+            *_conv_block(base_channels, hidden),
+            *_conv_block(hidden, hidden),
         )
-        self.fusion_conv = nn.Sequential(
-            nn.Conv2d(256, 256, kernel_size=3, padding=1),
-            nn.GroupNorm(16, 256),
-            nn.ReLU(),
-        )
-        self.feature_channels = 256
+        self.fusion_conv = nn.Sequential(*_conv_block(2 * hidden, 2 * hidden))
+        self.feature_channels = 2 * hidden
         self.spatial_context = DilatedSpatialContext(self.feature_channels)
         self.receptive_field = 9 + 2 * sum(self.spatial_context.dilations)
         self._finish_heads()
 
     def forward_features(self, states):
-        topology = torch.cat((states[:, 0:1], states[:, 5:]), dim=1)
-        density_features = self.density_encoder(topology)
-        boundary_features = self.bc_encoder(states[:, 1:5])
-        fused = self.fusion_conv(
-            torch.cat((density_features, boundary_features), dim=1)
-        )
-        return self.spatial_context(fused)
+        topology = self.density_encoder(states.index_select(1, self.topology_index))
+        boundary = self.bc_encoder(states.index_select(1, self.boundary_index))
+        return self.spatial_context(self.fusion_conv(torch.cat((topology, boundary), dim=1)))
 
 
 class PPO:
+    """Proximal policy optimization with GAE and minibatched updates.
+
+    ``width`` and ``height`` are the observation's spatial sizes in the order
+    callers already pass them: ``state.shape[1]`` and ``state.shape[2]``.
+
+    Schedules are active only when ``total_updates`` is given: the learning
+    rates then decay linearly to zero and the entropy coefficient moves
+    linearly from ``entropy_coef`` to ``entropy_coef_final``.
+    """
+
     def __init__(
         self,
         state_channels,
@@ -430,7 +377,7 @@ class PPO:
         gamma,
         K_epochs,
         eps_clip,
-        has_continuous_action_space,
+        has_continuous_action_space=False,
         action_std_init=0.6,
         gae_lambda=0.95,
         num_envs=1,
@@ -441,10 +388,18 @@ class PPO:
         value_coef=0.5,
         entropy_coef=0.01,
         max_grad_norm=0.5,
-        target_density=0.4,
+        target_density=None,
+        entropy_coef_final=None,
+        total_updates=None,
+        target_kl=None,
+        base_channels=64,
+        use_amp=None,
     ):
+        del action_std_init
+        if has_continuous_action_space:
+            raise ValueError("the grid environment has discrete actions only")
         self.device = torch.device(device)
-        self.has_continuous_action_space = bool(has_continuous_action_space)
+        self.has_continuous_action_space = False
         self.num_envs = int(num_envs)
         self.use_two_path = bool(use_two_path)
         self.gamma = float(gamma)
@@ -452,22 +407,27 @@ class PPO:
         self.eps_clip = float(eps_clip)
         self.K_epochs = int(K_epochs)
         self.state_channels = int(state_channels)
-        # These legacy argument names are observation height and width because
-        # callers pass state.shape[1] and state.shape[2].
+        # Legacy argument names: these are observation height and width.
         self.height = int(width)
         self.width = int(height)
         self.action_dim = int(action_dim)
         self.rollout_steps = int(rollout_steps)
+        self.base_channels = int(base_channels)
         requested_minibatch_size = int(minibatch_size)
-        # Bound activation memory by spatial pixels. This keeps the convenient
-        # 1024-sample batches on 6x6 while automatically reducing them on
-        # large grids (about 100 samples on 50x50).
+        # Bound activation memory by spatial pixels: 1024-sample batches on
+        # 6x6, automatically smaller on large grids (about 25 on 50x50).
         spatial_batch_limit = max(1, 65_536 // (self.height * self.width))
         self.minibatch_size = min(requested_minibatch_size, spatial_batch_limit)
         self.value_coef = float(value_coef)
-        self.entropy_coef = float(entropy_coef)
+        self.entropy_coef_start = float(entropy_coef)
+        self.entropy_coef_final = (
+            self.entropy_coef_start if entropy_coef_final is None else float(entropy_coef_final)
+        )
+        self.total_updates = None if total_updates is None else max(1, int(total_updates))
+        self.target_kl = None if target_kl is None else float(target_kl)
         self.max_grad_norm = float(max_grad_norm)
-        self.target_density = float(target_density)
+        self.target_density = None if target_density is None else float(target_density)
+        self.updates_done = 0
         if self.rollout_steps < 1 or self.minibatch_size < 1 or self.K_epochs < 1:
             raise ValueError("rollout_steps, minibatch_size, and K_epochs must be positive")
         if self.minibatch_size != requested_minibatch_size:
@@ -482,8 +442,6 @@ class PPO:
             channels=self.state_channels,
             height=self.height,
             width=self.width,
-            action_dim=self.action_dim,
-            continuous_actions=self.has_continuous_action_space,
             buffer_device="cpu",
         )
 
@@ -492,58 +450,52 @@ class PPO:
             num_actions=self.action_dim,
             width=self.height,
             height=self.width,
-            has_continuous_action_space=self.has_continuous_action_space,
-            action_std_init=action_std_init,
-            target_density=self.target_density,
             num_channels=self.state_channels,
+            base_channels=self.base_channels,
         )
-        architecture_name = "TwoPathActorCritic" if self.use_two_path else "CNNActorCritic"
-        print(f"Using fully convolutional {architecture_name}")
+        print(f"Using fully convolutional {model_class.__name__}")
         self.policy = model_class(**model_kwargs).to(self.device)
         self.policy_old = model_class(**model_kwargs).to(self.device)
 
-        if self.use_two_path:
-            actor_parameters = list(self.policy.density_encoder.parameters())
-            actor_parameters += list(self.policy.bc_encoder.parameters())
-            actor_parameters += list(self.policy.fusion_conv.parameters())
-        else:
-            actor_parameters = list(self.policy.encoder.parameters())
-        actor_parameters += list(self.policy.spatial_context.parameters())
-        actor_parameters += list(self.policy.actor_head.parameters())
         critic_parameters = list(self.policy.critic_head.parameters())
+        critic_ids = {id(parameter) for parameter in critic_parameters}
+        actor_parameters = [
+            parameter for parameter in self.policy.parameters() if id(parameter) not in critic_ids
+        ]
         self.optimizer = optim.Adam(
             (
                 {"params": actor_parameters, "lr": lr_actor},
                 {"params": critic_parameters, "lr": lr_critic},
             )
         )
-        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=1000, gamma=0.95)
+        if self.total_updates is None:
+            self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=1000, gamma=0.95)
+        else:
+            total = self.total_updates
+            self.scheduler = optim.lr_scheduler.LambdaLR(
+                self.optimizer, lambda update: max(0.0, 1.0 - update / total)
+            )
         self.policy_old.load_state_dict(self.policy.state_dict())
         self.policy_old.eval()
         self.value_loss = nn.MSELoss()
-        self.scaler = torch.amp.GradScaler(
-            "cuda", enabled=self.device.type == "cuda"
-        )
+        self.use_amp = (self.device.type == "cuda") if use_amp is None else bool(use_amp)
+        self.use_amp = self.use_amp and self.device.type == "cuda"
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
         self.actor_losses = []
         self.critic_losses = []
         self.entropies = []
         self.grad_norms = []
 
-    def set_action_std(self, new_action_std):
-        if not self.has_continuous_action_space:
-            raise RuntimeError("action standard deviation only applies to continuous policies")
-        self.policy.set_action_std(new_action_std)
-        self.policy_old.set_action_std(new_action_std)
-
-    def decay_action_std(self, action_std_decay_rate, min_action_std):
-        if not self.has_continuous_action_space:
-            raise RuntimeError("action standard deviation only applies to continuous policies")
-        new_std = max(
-            self.policy.action_std.item() - action_std_decay_rate, min_action_std
+    @property
+    def entropy_coef(self):
+        """Current entropy coefficient under the linear schedule."""
+        if self.total_updates is None:
+            return self.entropy_coef_start
+        progress = min(1.0, self.updates_done / self.total_updates)
+        return self.entropy_coef_start + progress * (
+            self.entropy_coef_final - self.entropy_coef_start
         )
-        self.set_action_std(new_std)
-        return new_std
 
     def select_action(self, states, deterministic=False):
         self.policy_old.eval()
@@ -588,19 +540,11 @@ class PPO:
         last_advantage = torch.zeros(self.num_envs)
         for step in reversed(range(rewards.shape[0])):
             next_value = (
-                last_state_values
-                if step == rewards.shape[0] - 1
-                else state_values[step + 1]
+                last_state_values if step == rewards.shape[0] - 1 else state_values[step + 1]
             )
             non_terminal = (~is_terminals[step]).float()
-            delta = (
-                rewards[step]
-                + gamma * next_value * non_terminal
-                - state_values[step]
-            )
-            last_advantage = (
-                delta + gamma * gae_lambda * non_terminal * last_advantage
-            )
+            delta = rewards[step] + gamma * next_value * non_terminal - state_values[step]
+            last_advantage = delta + gamma * gae_lambda * non_terminal * last_advantage
             advantages[step] = last_advantage
         returns = advantages + state_values
         return returns, advantages
@@ -617,26 +561,36 @@ class PPO:
             rewards, state_values, terminals, last_state_values=last_state_values
         )
 
+        # Invalid transitions (vector-environment reset steps) are dropped
+        # here. They never feed an earlier advantage, because the step before
+        # each of them is terminal.
+        keep = self.buffer.valid[:rollout_length].reshape(-1).nonzero(as_tuple=True)[0]
+        if keep.numel() == 0:
+            raise RuntimeError("the rollout contains no valid transitions")
         states = self.buffer.states[:rollout_length].reshape(
             -1, self.state_channels, self.height, self.width
+        )[keep]
+        actions = self.buffer.actions[:rollout_length].reshape(-1)[keep]
+        old_logprobs = self.buffer.logprobs[:rollout_length].reshape(-1)[keep]
+        old_values = state_values.reshape(-1)[keep]
+        returns = returns.reshape(-1)[keep]
+        advantages = advantages.reshape(-1)[keep]
+
+        return_variance = float(returns.var(unbiased=False))
+        explained_variance = (
+            float("nan")
+            if return_variance < 1e-12
+            else 1.0 - float((returns - old_values).var(unbiased=False)) / return_variance
         )
-        if self.has_continuous_action_space:
-            actions = self.buffer.actions[:rollout_length].reshape(-1, self.action_dim)
-        else:
-            actions = self.buffer.actions[:rollout_length].reshape(-1)
-        old_logprobs = self.buffer.logprobs[:rollout_length].reshape(-1)
-        returns = returns.reshape(-1)
-        advantages = advantages.reshape(-1)
-        advantages = (advantages - advantages.mean()) / (
-            advantages.std(unbiased=False) + 1e-8
-        )
+        value_offset = float((old_values - returns).mean())
+        advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
 
         num_samples = states.shape[0]
         batch_size = min(self.minibatch_size, num_samples)
-        actor_epoch_losses = []
-        critic_epoch_losses = []
-        entropy_values = []
-        gradient_norms = []
+        entropy_coef = self.entropy_coef
+        actor_losses, critic_losses, entropies, gradient_norms = [], [], [], []
+        kls, clip_fractions = [], []
+        stopped_early = False
         self.policy.train()
 
         for _ in range(self.K_epochs):
@@ -649,25 +603,29 @@ class PPO:
                 batch_returns = returns[indices].to(self.device)
                 batch_advantages = advantages[indices].to(self.device)
 
-                with torch.autocast(
-                    device_type=self.device.type, enabled=self.device.type == "cuda"
-                ):
+                with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+                    # Convolutions may run in half precision; the logits and
+                    # values come back in float32, so the distribution, the
+                    # ratio and the losses are all computed in float32.
                     new_logprobs, new_values, entropy = self.policy.evaluate(
                         batch_states, batch_actions
                     )
-                    ratios = torch.exp(new_logprobs - batch_old_logprobs)
-                    surrogate_1 = ratios * batch_advantages
-                    surrogate_2 = torch.clamp(
-                        ratios, 1 - self.eps_clip, 1 + self.eps_clip
-                    ) * batch_advantages
-                    actor_loss = -torch.min(surrogate_1, surrogate_2).mean()
-                    critic_loss = self.value_loss(new_values, batch_returns)
-                    entropy_mean = entropy.mean()
-                    loss = (
-                        actor_loss
-                        + self.value_coef * critic_loss
-                        - self.entropy_coef * entropy_mean
-                    )
+                log_ratio = new_logprobs - batch_old_logprobs
+                ratios = torch.exp(log_ratio)
+                with torch.no_grad():
+                    approx_kl = float(((ratios - 1.0) - log_ratio).mean())
+                    clip_fraction = float(((ratios - 1.0).abs() > self.eps_clip).float().mean())
+                if self.target_kl is not None and approx_kl > 1.5 * self.target_kl:
+                    stopped_early = True
+                    break
+                surrogate_1 = ratios * batch_advantages
+                surrogate_2 = (
+                    torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * batch_advantages
+                )
+                actor_loss = -torch.min(surrogate_1, surrogate_2).mean()
+                critic_loss = self.value_loss(new_values, batch_returns)
+                entropy_mean = entropy.mean()
+                loss = actor_loss + self.value_coef * critic_loss - entropy_coef * entropy_mean
 
                 self.optimizer.zero_grad(set_to_none=True)
                 self.scaler.scale(loss).backward()
@@ -678,16 +636,31 @@ class PPO:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
 
-                actor_epoch_losses.append(float(actor_loss.detach().cpu()))
-                critic_epoch_losses.append(float(critic_loss.detach().cpu()))
-                entropy_values.append(float(entropy_mean.detach().cpu()))
-                gradient_norms.append(float(gradient_norm.detach().cpu()))
+                actor_losses.append(float(actor_loss.detach()))
+                critic_losses.append(float(critic_loss.detach()))
+                entropies.append(float(entropy_mean.detach()))
+                gradient_norms.append(float(gradient_norm))
+                kls.append(approx_kl)
+                clip_fractions.append(clip_fraction)
+            if stopped_early:
+                break
+
+        def mean(values):
+            return sum(values) / len(values) if values else float("nan")
 
         metrics = {
-            "actor_loss": sum(actor_epoch_losses) / len(actor_epoch_losses),
-            "critic_loss": sum(critic_epoch_losses) / len(critic_epoch_losses),
-            "entropy": sum(entropy_values) / len(entropy_values),
-            "grad_norm": sum(gradient_norms) / len(gradient_norms),
+            "actor_loss": mean(actor_losses),
+            "critic_loss": mean(critic_losses),
+            "entropy": mean(entropies),
+            "grad_norm": mean(gradient_norms),
+            "approx_kl": mean(kls),
+            "clip_fraction": mean(clip_fractions),
+            "explained_variance": explained_variance,
+            "value_offset": value_offset,
+            "entropy_coef": entropy_coef,
+            "learning_rate": self.optimizer.param_groups[0]["lr"],
+            "gradient_steps": len(actor_losses),
+            "stopped_early": stopped_early,
             "rollout_steps": rollout_length,
             "samples": num_samples,
         }
@@ -700,6 +673,7 @@ class PPO:
         self.policy_old.eval()
         self.buffer.clear()
         self.scheduler.step()
+        self.updates_done += 1
         return metrics
 
     def save(self, checkpoint_path):
@@ -709,32 +683,53 @@ class PPO:
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "scheduler_state_dict": self.scheduler.state_dict(),
                 "architecture": "two_path" if self.use_two_path else "single_path",
+                "base_channels": self.base_channels,
+                "layout_version": layout.LAYOUT_VERSION,
                 "observation_shape": (self.state_channels, self.height, self.width),
                 "action_dim": self.action_dim,
+                "updates_done": self.updates_done,
                 "target_density": self.target_density,
             },
             checkpoint_path,
         )
 
-    def load(self, checkpoint_path):
-        checkpoint = torch.load(
-            checkpoint_path, map_location=self.device, weights_only=True
-        )
-        saved_target_density = checkpoint.get("target_density")
-        if saved_target_density is not None and not math.isclose(
-            float(saved_target_density), self.target_density, rel_tol=0.0, abs_tol=1e-12
-        ):
+    def load(self, checkpoint_path, weights_only=False):
+        """Load a checkpoint. ``weights_only=True`` skips optimizer state.
+
+        The network is fully convolutional, so weights trained on one grid
+        size load into an agent built for another. Use ``weights_only=True``
+        in that case and for evaluation.
+        """
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
+        if checkpoint.get("layout_version") != layout.LAYOUT_VERSION:
             raise ValueError(
-                "checkpoint target density does not match the current PPO agent"
+                "this checkpoint was trained with an older observation and action layout "
+                f"and cannot be loaded (expected layout version {layout.LAYOUT_VERSION}). "
+                "Retrain with the current environment."
+            )
+        architecture = "two_path" if self.use_two_path else "single_path"
+        if checkpoint.get("architecture") != architecture:
+            raise ValueError(
+                f"checkpoint architecture is {checkpoint.get('architecture')!r}, "
+                f"but this agent is {architecture!r}"
+            )
+        if checkpoint.get("base_channels", 64) != self.base_channels:
+            raise ValueError(
+                f"checkpoint has base_channels={checkpoint.get('base_channels', 64)}, "
+                f"but this agent has base_channels={self.base_channels}"
             )
         self.policy_old.load_state_dict(checkpoint["policy_state_dict"])
         self.policy.load_state_dict(checkpoint["policy_state_dict"])
-        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        if "scheduler_state_dict" in checkpoint:
-            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        if not weights_only:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            if "scheduler_state_dict" in checkpoint:
+                self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            self.updates_done = int(checkpoint.get("updates_done", 0))
         self.policy_old.eval()
 
     def plot_metrics(self, save_path=None):
+        import matplotlib.pyplot as plt
+
         updates = range(1, len(self.actor_losses) + 1)
         figure, axes = plt.subplots(2, 2, figsize=(16, 10))
         axes[0, 0].plot(updates, self.actor_losses)

@@ -1,0 +1,36 @@
+{
+ "name": "beam_1",
+ "width": 80,
+ "height": 40,
+ "density": 0.45,
+ "reference_source": "mma",
+ "reference": {
+  "objective_cost": 11.771507275632615,
+  "compliance": 93.46976611807538,
+  "compliance_ratio": 0.1704147868262092,
+  "contacts": 627.0
+ },
+ "other_start": {
+  "objective_cost": 13.454117768260257,
+  "compliance": 98.46494635264472,
+  "compliance_ratio": 0.17952203733283062,
+  "contacts": 710.0
+ },
+ "best": {
+  "objective_cost": -0.4504162010928557,
+  "compliance": 93.0567068255164,
+  "compliance_ratio": 0.16966169398976086,
+  "contacts": 16.0
+ },
+ "final": {
+  "objective_cost": -0.4504162010928557,
+  "compliance": 93.0567068255164,
+  "compliance_ratio": 0.16966169398976086,
+  "contacts": 16.0
+ },
+ "steps": 4800,
+ "stopped": false,
+ "seconds_reference": 15.678399082040414,
+ "seconds_policy": 65.42347926099319,
+ "checkpoint": "src/PPO_preTrained/scalable/ppo_12x6_seed0_1.pth"
+}
