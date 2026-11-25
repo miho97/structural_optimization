@@ -116,3 +116,6 @@ surrogate_models/
 # Reward logs
 reward_logs.log
 training_metrics.png
+
+# Saved benchmark designs are small and needed to redraw the figures
+!benchmarks/**/*.npz

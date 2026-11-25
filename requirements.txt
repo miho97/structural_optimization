@@ -1,0 +1,7 @@
+autograd>=1.6
+gymnasium>=1.0
+matplotlib>=3.7
+nlopt>=2.7
+numpy>=1.26
+scipy>=1.10
+torch>=2.1

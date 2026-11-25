@@ -1,0 +1,47 @@
+{
+ "name": "random_mixed_10013",
+ "width": 80,
+ "height": 40,
+ "density": 0.45,
+ "checkpoint": "src/PPO_preTrained/scalable/ppo_12x6_seed1_0.pth",
+ "simp": {
+  "objective_cost": -0.9927453538102242,
+  "compliance": 8.875948626669734,
+  "compliance_ratio": 0.10168447394505385,
+  "contacts": 0.0,
+  "rmin": 3.0,
+  "gray_compliance": 8.902748676444523,
+  "best_iteration": 339,
+  "by_radius": {
+   "1.5": 8.881879990858987,
+   "2.0": 8.879007925299666,
+   "3.0": 8.875948626669734
+  }
+ },
+ "mma": {
+  "objective_cost": 2.1326177384550133,
+  "compliance": 8.986237079110339,
+  "compliance_ratio": 0.10294795841756872,
+  "contacts": 156.0
+ },
+ "best": {
+  "objective_cost": -0.23164247456340836,
+  "compliance": 9.317891715590859,
+  "compliance_ratio": 0.10674745396000891,
+  "contacts": 37.0
+ },
+ "final": {
+  "objective_cost": -0.23164247456340836,
+  "compliance": 9.317891715590859,
+  "compliance_ratio": 0.10674745396000891,
+  "contacts": 37.0
+ },
+ "steps": 4800,
+ "stopped": false,
+ "seconds": {
+  "simp": 19.595400298014283,
+  "mma": 7.563355722930282,
+  "agent": 113.85358201805502
+ },
+ "domain": {}
+}

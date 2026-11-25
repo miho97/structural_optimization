@@ -1,587 +1,638 @@
+"""Gymnasium environment for density-based structural optimization.
+
+Coordinate convention
+---------------------
+``width`` is the number of finite elements along X (columns) and ``height`` is
+the number along Y (rows). Density fields and images use ``(height, width)`` /
+``(channels, height + 1, width + 1)`` ordering. The FEM helpers store nodal
+data in ``(x, y, dof)`` ordering, so nodal channels are transposed exactly once
+when the observation is built.
+
+Episode
+-------
+1. Construction: every cell starts undecided at the target density and is
+   assigned exactly once to void or solid. The action mask enforces the solid
+   budget, so a finished construction always has the target volume.
+2. Refinement: a swap removes one solid cell and then fills a different void
+   cell, which preserves the volume. The stop action ends the episode, and at
+   most ``max_refinement_swaps`` swaps are allowed.
+
+Actions are ``0 .. N-1`` (make cell void), ``N .. 2N-1`` (make cell solid) and
+``2N`` (stop), with ``N = width * height``.
+
+Reward
+------
+The objective is ``log10(C / C0)`` plus a cost per corner-only contact, where
+``C0`` is the compliance of the uniform starting field. A step pays the
+decrease in that objective. The removal half of a swap pays nothing and the
+addition half pays for the pair, so an under-filled design is never scored.
+Summed over an episode the reward equals the total drop in the objective.
+"""
+
+from __future__ import annotations
+
 import gymnasium as gym
-import torch
 import numpy as np
-import matplotlib.pyplot as plt
-import networkx as nx  
-from utils import fem
-import logging
-import torch.nn.functional as F
+
+from env.domains import (
+    MAXIMUM_DENSITY,
+    MINIMUM_DENSITY,
+    legacy_random_beam,
+    sample_domain,
+    solid_cell_budget,
+)
+from utils import fem, layout
+from utils.fem_fast import FastFEM
+
+# Kept under its original name for existing notebooks.
+generate_random_beam = legacy_random_beam
+
+UNDECIDED, SOLID, VOID = 0, 1, 2
+PHASES = ("construction", "refinement_remove", "refinement_add", "complete")
+
+# Above this many decades of compliance ratio the objective keeps only a
+# shallow slope. A disconnected design then costs about 2.3 to 2.5 instead of
+# 5 to 7, which keeps value targets in a sane range without making all
+# disconnected designs look identical.
+LOG_RATIO_KNEE = 2.0
+LOG_RATIO_TAIL_SLOPE = 0.1
+
+DEFAULT_REWARD_WEIGHTS = {
+    "w_compliance": 1.0,
+    # Cost per pair of solid cells that touch only at a corner while both
+    # cells beside that corner are void. Four-node elements transmit load
+    # through such a point contact, which no real structure can do.
+    # 0.02 decades is about 5% of compliance. Set to 0 to disable.
+    "w_contact": 0.02,
+    # Legacy terms. The action mask already enforces the volume and every
+    # finished design is binary, so both default to zero.
+    "w_total_mass": 0.0,
+    "w_binary": 0.0,
+}
 
 
-def generate_random_beam(width, height, density=0.4):
-    """
-    Generate a random but VALID beam configuration.
-    
-    Uses one of three valid structural templates:
-    - cantilever: One edge fully fixed, force on opposite side
-    - simply_supported: Both ends supported, force on top
-    - corner_supported: MBB-style with edge + corner support
-    
-    Returns:
-        normals: np.ndarray of shape (width+1, height+1, 2)
-        forces: np.ndarray of shape (width+1, height+1, 2)
-        density: float
-    """
-    normals = np.zeros((width + 1, height + 1, 2))
-    forces = np.zeros((width + 1, height + 1, 2))
-    
-    # Pick a random valid template
-    template = np.random.choice(['cantilever', 'simply_supported', 'corner_supported'])
-    
-    if template == 'cantilever':
-        # Fix one edge (left or right), force anywhere on opposite side
-        fixed_edge = np.random.choice(['left', 'right'])
-        if fixed_edge == 'left':
-            normals[0, :, 0] = 1  # Fix left edge in X
-            normals[0, 0, 1] = 1  # Pin bottom-left in Y (minimum constraint)
-            normals[0, height, 1] = 1  # Pin top-left in Y
-            force_x = width  # Force on right side
-        else:
-            normals[width, :, 0] = 1  # Fix right edge in X
-            normals[width, 0, 1] = 1  # Pin bottom-right in Y
-            normals[width, height, 1] = 1  # Pin top-right in Y
-            force_x = 0  # Force on left side
-        
-        force_y = np.random.randint(0, height + 1)
-        forces[force_x, force_y, 1] = -1  # Downward force
-        
-    elif template == 'simply_supported':
-        # Pin both bottom corners, force somewhere on top
-        normals[0, height, 1] = 1       # Left bottom corner Y
-        normals[width, height, 1] = 1   # Right bottom corner Y
-        normals[0, height, 0] = 1       # Left bottom corner X (prevent sliding)
-        
-        # Force on top edge (not at corners)
-        force_x = np.random.randint(1, width)
-        forces[force_x, 0, 1] = -1
-        
-    elif template == 'corner_supported':
-        # MBB-style: one edge X-fixed, one corner Y-pinned
-        # Randomly choose orientation
-        if np.random.random() < 0.5:
-            # Left edge fixed
-            normals[0, :, 0] = 1
-            corner_y = np.random.choice([0, height])  # Top or bottom right corner
-            normals[width, corner_y, 1] = 1
-            
-            # Force at random location on left edge
-            force_y = np.random.randint(0, height + 1)
-            forces[0, force_y, 1] = -1
-        else:
-            # Right edge fixed
-            normals[width, :, 0] = 1
-            corner_y = np.random.choice([0, height])  # Top or bottom left corner
-            normals[0, corner_y, 1] = 1
-            
-            # Force at random location on right edge
-            force_y = np.random.randint(0, height + 1)
-            forces[width, force_y, 1] = -1
-    
-    return normals, forces, density
+def count_corner_contacts(status):
+    """Number of solid pairs joined only through a corner between two voids."""
+    solid = status == SOLID
+    void = status == VOID
+    main = solid[:-1, :-1] & solid[1:, 1:] & void[:-1, 1:] & void[1:, :-1]
+    anti = solid[:-1, 1:] & solid[1:, :-1] & void[:-1, :-1] & void[1:, 1:]
+    return int(np.count_nonzero(main) + np.count_nonzero(anti))
+
+
+def soft_log_ratio(compliance, base_compliance):
+    """``log10(C / C0)`` with a shallow slope above ``LOG_RATIO_KNEE``."""
+    if not np.isfinite(compliance) or compliance <= 0:
+        raw = 12.0
+    else:
+        raw = float(np.log10(max(compliance / base_compliance, 1e-12)))
+    if raw > LOG_RATIO_KNEE:
+        return LOG_RATIO_KNEE + LOG_RATIO_TAIL_SLOPE * (raw - LOG_RATIO_KNEE)
+    return raw
 
 
 class BeamOptimizationEnv(gym.Env):
-    metadata = {'render.modes': ['human']}  
-    
-    def __init__(self, width=4, height=4, density=0.4, step_size=0.5, 
-                 optimal_density=0.5, reward_weights=None, beam_type=1,
-                 custom_normals=None, custom_forces=None, use_random_beam=False):
-        """
-        Initialize the beam optimization environment.
-        
-        Args:
-            width, height: Grid dimensions
-            density: Target volume fraction
-            beam_type: Predefined beam type (1-9), used if custom_normals/forces not provided
-            custom_normals: Optional custom boundary conditions (normals array)
-            custom_forces: Optional custom forces array
-            use_random_beam: If True, generate a new random beam on each reset()
-        """
-        super(BeamOptimizationEnv, self).__init__()
-        # Environments run on CPU; only the PPO model uses GPU for batched inference
-        self.device = 'cpu'
-        self.width = width
-        self.height = height
-        self.density = density
-        self.step_size_initial = 0.5
-        self.step_size_final = 0.05
-        self.optimal_density = optimal_density  
-        self.max_steps = self.width * self.height * 3
-        self.action_space = gym.spaces.Discrete(2 * self.width * self.height)
-        
-        # Determine number of edges based on beam structure
-        self.number_of_edges = (self.width * (self.height + 1)) + ((self.width + 1) * self.height)
-        self.state_dim = (self.width * self.height) + (self.number_of_edges * 2)  # Densities + normals + forces
-        self.observation_space = gym.spaces.Box(
-            low=0.0,
-            high=1.0,
-            shape=(5, width+1, height+1),
-            dtype=np.float32
-        )
-        
-        self.best_compliance = torch.full((10,), float('inf'), dtype=torch.float32, device=self.device)
-        self.beam_type = beam_type
-        self.use_random_beam = use_random_beam
-        self.phase_threshold_1 = 0.05
-        self.phase_threshold_2 = 0.1
+    """Sequential density-editing environment backed by a banded FEM solver."""
 
-        # Store beam functions for reference
+    metadata = {"render_modes": ["human"]}
+    minimum_density = MINIMUM_DENSITY
+    maximum_density = MAXIMUM_DENSITY
+
+    def __init__(
+        self,
+        width=4,
+        height=4,
+        density=0.4,
+        step_size=0.5,
+        optimal_density=None,
+        reward_weights=None,
+        beam_type=1,
+        custom_normals=None,
+        custom_forces=None,
+        use_random_beam=False,
+        max_steps=None,
+        max_refinement_swaps=None,
+        random_domain="mixed",
+        density_range=None,
+    ):
+        super().__init__()
+        del step_size  # accepted for compatibility; assignments are explicit
+        if width < 1 or height < 1:
+            raise ValueError("width and height must both be positive")
+        if (custom_normals is None) != (custom_forces is None):
+            raise ValueError("custom_normals and custom_forces must be supplied together")
+        if random_domain not in ("legacy", "rich", "mixed"):
+            raise ValueError("random_domain must be 'legacy', 'rich' or 'mixed'")
+
+        self.width = int(width)
+        self.height = int(height)
+        self.total_cells = self.width * self.height
+        self.use_random_beam = bool(use_random_beam)
+        self.random_domain = random_domain
+        self.beam_type = int(beam_type)
+        self.custom_normals = custom_normals
+        self.custom_forces = custom_forces
+        if density_range is not None:
+            low, high = (float(value) for value in density_range)
+            if not self.minimum_density < low <= high < self.maximum_density:
+                raise ValueError("density_range must lie strictly between the density bounds")
+            if not self.use_random_beam:
+                raise ValueError("density_range needs use_random_beam=True")
+            density_range = (low, high)
+        self.density_range = density_range
+
+        target = float(density if optimal_density is None else optimal_density)
+        self._check_target_density(target)
+
+        if max_refinement_swaps is None:
+            if max_steps is None:
+                max_refinement_swaps = max(1, self.total_cells // 4)
+            else:
+                extra = int(max_steps) - self.total_cells
+                if extra < 0:
+                    raise ValueError("max_steps must allow one assignment per physical cell")
+                if extra % 2:
+                    raise ValueError(
+                        "steps after construction must come in remove/add refinement pairs"
+                    )
+                max_refinement_swaps = extra // 2
+        self.max_refinement_swaps = int(max_refinement_swaps)
+        if self.max_refinement_swaps < 0:
+            raise ValueError("max_refinement_swaps must not be negative")
+        self.max_steps = self.total_cells + 2 * self.max_refinement_swaps
+
+        self.stop_action = 2 * self.total_cells
+        self.action_space = gym.spaces.Discrete(2 * self.total_cells + 1)
+        observation_shape = (layout.NUM_CHANNELS, self.height + 1, self.width + 1)
+        self.observation_space = gym.spaces.Box(-1.0, 1.0, observation_shape, dtype=np.float32)
+        self.state_dim = int(np.prod(observation_shape))
+
         self.beam_functions = {
-            1: fem.mbb_beam_1,
-            2: fem.mbb_beam_2,
-            3: fem.mbb_beam_3,
-            4: fem.mbb_beam_4,
-            5: fem.mbb_beam_5,
-            6: fem.mbb_beam_6,
-            7: fem.mbb_beam_7,
-            8: fem.mbb_beam_8,
-            9: fem.mbb_beam_9
+            index: getattr(fem, f"mbb_beam_{index}") for index in range(1, 10)
+        }
+        if (
+            not self.use_random_beam
+            and custom_normals is None
+            and self.beam_type not in self.beam_functions
+        ):
+            raise ValueError(f"beam_type must be one of {sorted(self.beam_functions)}")
+
+        weights = dict(DEFAULT_REWARD_WEIGHTS)
+        unknown = set(reward_weights or {}) - set(weights)
+        if unknown:
+            raise ValueError(f"unknown reward weights: {sorted(unknown)}")
+        weights.update(reward_weights or {})
+        self.w_compliance = float(weights["w_compliance"])
+        self.w_contact = float(weights["w_contact"])
+        self.w_total_mass = float(weights["w_total_mass"])
+        self.w_binary = float(weights["w_binary"])
+
+        self._obs = np.zeros(observation_shape, dtype=np.float32)
+        self.domain_meta = {}
+        self._set_target_density(target)
+        if custom_normals is not None:
+            normals, forces = custom_normals, custom_forces
+        elif self.use_random_beam:
+            normals, forces = self._sample_problem()
+        else:
+            normals, forces, _ = self.beam_functions[self.beam_type](
+                self.width, self.height, self.target_density
+            )
+        self._set_problem(normals, forces)
+        self.reset(options={"regenerate_beam": False})
+
+    # ------------------------------------------------------------------
+    # Problem setup
+    # ------------------------------------------------------------------
+    def _check_target_density(self, target):
+        if not self.minimum_density < target < self.maximum_density:
+            raise ValueError("target density must lie strictly between the void and solid bounds")
+
+    def _set_target_density(self, target):
+        self.target_density = float(target)
+        # Compatibility aliases.
+        self.density = self.target_density
+        self.optimal_density = self.target_density
+        self.solid_cell_budget = solid_cell_budget(self.width, self.height, self.target_density)
+
+    def _sample_problem(self):
+        if self.density_range is not None:
+            low, high = self.density_range
+            self._set_target_density(self.np_random.uniform(low, high))
+        normals, forces, meta = sample_domain(
+            self.width, self.height, self.target_density, self.np_random, self.random_domain
+        )
+        self.domain_meta = meta
+        return normals, forces
+
+    def _set_problem(self, normals, forces):
+        expected_shape = (self.width + 1, self.height + 1, 2)
+        normals = np.asarray(normals, dtype=np.float64)
+        forces = np.asarray(forces, dtype=np.float64)
+        if normals.shape != expected_shape or forces.shape != expected_shape:
+            raise ValueError(
+                f"normals and forces must both have shape {expected_shape}; "
+                f"got {normals.shape} and {forces.shape}"
+            )
+        if not np.isfinite(normals).all() or not np.isfinite(forces).all():
+            raise ValueError("normals and forces must be finite")
+        if not np.any(normals):
+            raise ValueError("the structure must have at least one constrained degree of freedom")
+        if not np.any(forces):
+            raise ValueError("the structure must have at least one non-zero load")
+        if np.any(normals < 0) or np.any(normals > 1):
+            raise ValueError("normal/support indicators must lie in [0, 1]")
+        if np.any(forces < -1) or np.any(forces > 1):
+            raise ValueError("force values must lie in [-1, 1]")
+
+        self.normals = normals
+        self.forces = forces
+        self.solver = FastFEM(normals, forces)
+        uniform = np.full((self.height, self.width), self.target_density)
+        base_compliance, base_energy = self.solver.solve(uniform, return_energy=True)
+        if not np.isfinite(base_compliance) or base_compliance <= 0:
+            raise ValueError("the supplied support/load problem has invalid base compliance")
+        self.base_compliance_value = float(base_compliance)
+        self._base_energy = base_energy
+        self._args = None  # autograd problem description, built on demand
+
+        # FEM nodal arrays are [x, y, dof]; image channels are [y, x].
+        self._obs[layout.SUPPORT_X] = normals[:, :, 0].T
+        self._obs[layout.SUPPORT_Y] = normals[:, :, 1].T
+        self._obs[layout.FORCE_X] = forces[:, :, 0].T
+        self._obs[layout.FORCE_Y] = forces[:, :, 1].T
+        self._obs[layout.TARGET] = self.solid_cell_budget / self.total_cells
+
+    @property
+    def args(self):
+        """``utils.fem`` problem description, for MMA and gradient code."""
+        if self._args is None:
+            self._args = fem.get_args(self.normals, self.forces, self.target_density)
+        return self._args
+
+    # ------------------------------------------------------------------
+    # State helpers
+    # ------------------------------------------------------------------
+    @property
+    def phase(self):
+        return PHASES[self._phase_id]
+
+    def _update_phase(self):
+        if self._terminated:
+            self._phase_id = 3
+        elif self._undecided_count > 0:
+            self._phase_id = 0
+        elif self.pending_removal_cell is not None:
+            self._phase_id = 2
+        else:
+            self._phase_id = 1
+
+    def _swap_possible(self):
+        return (
+            self.completed_refinement_swaps < self.max_refinement_swaps
+            and 0 < self._solid_count < self.total_cells
+        )
+
+    def _update_mask(self):
+        cells = self.total_cells
+        mask = np.zeros(2 * cells + 1, dtype=bool)
+        if not self._terminated:
+            status = self._status.reshape(-1)
+            if self._undecided_count > 0:
+                undecided = status == UNDECIDED
+                # Void is allowed only while the remaining undecided cells can
+                # still fill the budget; solid only until the budget is full.
+                if self._solid_count + self._undecided_count - 1 >= self.solid_cell_budget:
+                    mask[:cells] = undecided
+                if self._solid_count < self.solid_cell_budget:
+                    mask[cells : 2 * cells] = undecided
+            elif self.pending_removal_cell is not None:
+                mask[cells : 2 * cells] = status == VOID
+                mask[cells + self.pending_removal_cell] = False
+            else:
+                if self._swap_possible():
+                    mask[:cells] = status == SOLID
+                mask[self.stop_action] = True
+        self._mask = mask
+
+    def valid_action_mask(self):
+        """Boolean mask over the ``2N + 1`` actions for the current state."""
+        return self._mask.copy()
+
+    def density_field(self):
+        """Copy of the physical ``(height, width)`` density field."""
+        return self._density.copy()
+
+    def best_density_field(self):
+        """Best completed design of this episode, or ``None`` before one exists."""
+        return None if self._best_density is None else self._best_density.copy()
+
+    def _refresh_observation(self, energy):
+        obs = self._obs
+        h, w = self.height, self.width
+        status = self._status
+        obs[layout.UNDECIDED, :h, :w] = status == UNDECIDED
+        obs[layout.SOLID, :h, :w] = status == SOLID
+        obs[layout.VOID, :h, :w] = status == VOID
+        obs[layout.PENDING] = 0.0
+        if self.pending_removal_cell is not None:
+            row, col = divmod(self.pending_removal_cell, w)
+            obs[layout.PENDING, row, col] = 1.0
+        mean_energy = float(np.mean(energy))
+        if np.isfinite(mean_energy) and mean_energy > 0:
+            scaled = np.log10(np.maximum(energy, 1e-300) / mean_energy)
+            obs[layout.ENERGY, :h, :w] = np.clip(scaled, -3.0, 3.0) / 3.0
+        else:
+            obs[layout.ENERGY, :h, :w] = 0.0
+        obs[layout.BUDGET_LEFT] = (self.solid_cell_budget - self._solid_count) / self.total_cells
+        swaps_left = self.max_refinement_swaps - self.completed_refinement_swaps
+        obs[layout.SWAPS_LEFT] = swaps_left / max(self.max_refinement_swaps, 1)
+
+    # ------------------------------------------------------------------
+    # Objective
+    # ------------------------------------------------------------------
+    def _objective(self, compliance, contacts, density):
+        cost = self.w_compliance * soft_log_ratio(compliance, self.base_compliance_value)
+        cost += self.w_contact * contacts
+        if self.w_total_mass:
+            volume_error = (float(np.mean(density)) - self.target_density) / self.target_density
+            cost += self.w_total_mass * volume_error**2
+        if self.w_binary:
+            cost += self.w_binary * float(np.mean(4.0 * density * (1.0 - density)))
+        return float(cost)
+
+    def evaluate_design(self, density):
+        """Score an arbitrary density field on the current problem.
+
+        Cells at the solid bound count as solid and cells at the void bound as
+        void. Used by the benchmark and by reference optimizers so that they
+        optimize exactly what the agent is rewarded for.
+        """
+        density = np.asarray(density, dtype=np.float64).reshape(self.height, self.width)
+        status = np.full(density.shape, UNDECIDED, dtype=np.int8)
+        status[density >= self.maximum_density - 1e-6] = SOLID
+        status[density <= self.minimum_density + 1e-6] = VOID
+        compliance = self.solver.solve(density)
+        contacts = count_corner_contacts(status)
+        return {
+            "objective_cost": self._objective(compliance, contacts, density),
+            "compliance": float(compliance),
+            "compliance_ratio": float(compliance / self.base_compliance_value),
+            "contacts": contacts,
         }
 
-        # Initialize beam properties based on input mode
-        if custom_normals is not None and custom_forces is not None:
-            # Use custom normals/forces
-            normals = custom_normals
-            forces = custom_forces
-        elif use_random_beam:
-            # Generate random beam (will be regenerated on each reset)
-            normals, forces, _ = generate_random_beam(width, height, density)
-        else:
-            # Use predefined beam type
-            normals, forces, _ = self.beam_functions[beam_type](width, height, density)
-        
-        self.normals = torch.tensor(normals, dtype=torch.float32, device=self.device)
-        self.forces = torch.tensor(forces, dtype=torch.float32, device=self.device)
-        self.args = fem.get_args(self.normals.cpu().numpy(), self.forces.cpu().numpy(), density)
-        
-        self.current_compliance = float('inf')
-        self.previous_compliance = float('inf')
-        self.current_constraint = 0.5 
-        self.reward = 0
-        
-        # Set reward weights
-        if reward_weights is None:
-            self.w_compliance = 1.0
-            self.w_density_high = 1.0   
-            self.w_density_low = 1.0    
-            self.w_total_mass = 1.0
-            self.w_entropy = 0.5
-        else:
-            self.w_compliance = reward_weights.get('w_compliance', 1.0)
-            self.w_density_high = reward_weights.get('w_density_high', 1.0)  
-            self.w_density_low = reward_weights.get('w_density_low', 1.0)    
-            self.w_total_mass = reward_weights.get('w_total_mass', 1.0)
-            self.w_entropy = reward_weights.get('w_entropy', 0.5)
-
-        self.weight_matrices = {
-            7: self.compute_weight_matrix(size=7),
-            5: self.compute_weight_matrix(size=5),
-            3: self.compute_weight_matrix(size=3)
-        }
-
-        # Compute base_compliance for normalization
-        self._compute_base_compliance()
-
-        self.reset()
-    
-    def _compute_base_compliance(self):
-        """Compute the base compliance for the current beam configuration."""
-        # Use the current normals/forces to compute base compliance
-        base_c, _ = fem.optim(self.args, x=None)
-        self.base_compliance = {self.beam_type: base_c}
-
-    def construct_cnn_state(self, densities, normals, forces):
-        """
-        Constructs a multi-channel state tensor for CNN input.
-        """
-        # Ensure densities is 2D: [width, height]
-        if densities.dim() == 1:
-            densities = densities.view(self.width, self.height)
-        
-        # Pad densities to (width+1, height+1)
-        densities_padded = F.pad(densities, (0, 1, 0, 1), mode='constant', value=0.0)
-        
-        # Reshape normals and forces
-        normals_grid = normals.view(self.width + 1, self.height + 1, 2)
-        forces_grid = forces.view(self.width + 1, self.height + 1, 2)
-        
-        # Split into separate channels
-        normals_x = normals_grid[:, :, 0]
-        normals_y = normals_grid[:, :, 1]
-        forces_x = forces_grid[:, :, 0]
-        forces_y = forces_grid[:, :, 1]
-        
-        # Stack into channels
-        state_channels = torch.stack([
-            densities_padded,  # Channel 1: Densities
-            normals_x,        # Channel 2: Normals X
-            normals_y,        # Channel 3: Normals Y
-            forces_x,         # Channel 4: Forces X
-            forces_y          # Channel 5: Forces Y
-        ], dim=0)  # Shape: (5, width+1, height+1)
-        
-        return state_channels
-
-
-    def reset(self, *, seed=None, options=None):
-        if seed is not None:
-            np.random.seed(seed)
-            torch.manual_seed(seed)
-        
-        # If using random beams, generate a new beam configuration each episode
-        if self.use_random_beam:
-            normals, forces, _ = generate_random_beam(self.width, self.height, self.density)
-            self.normals = torch.tensor(normals, dtype=torch.float32, device=self.device)
-            self.forces = torch.tensor(forces, dtype=torch.float32, device=self.device)
-            self.args = fem.get_args(self.normals.cpu().numpy(), self.forces.cpu().numpy(), self.density)
-            # Recompute base compliance for the new beam
-            self._compute_base_compliance()
-        
-        # Initialize densities as a 2D tensor: [width, height]
-        densities = torch.ones((self.width, self.height), dtype=torch.float32, device=self.device) * self.optimal_density
-        
-        # Reset other variables
-        self.current_step = 0
-        self.visited = torch.zeros((self.width * self.height), dtype=torch.bool, device=self.device)
-        self.visited_cells = set()
-        
-        # Compute initial compliance so first step has valid baseline for improvement reward
-        densities_np = densities.cpu().numpy()
-        initial_compliance, initial_constraint = fem.optim(args=self.args, x=densities_np)
-        self.current_compliance = initial_compliance
-        self.previous_compliance = initial_compliance  # Now first step can compute improvement!
-        self.current_constraint = initial_constraint
-        self.reward = 0
-        
-        # Construct the initial state
-        self.state = self.construct_cnn_state(densities, self.normals, self.forces)
-        
-        return self.state.cpu().numpy(), {}
-
-
-    def check_connectivity(self, densities):
-        """
-        Checks the connectivity of the structure based on current densities.
-        Returns a penalty based on the number and size of disconnected components.
-        """
-        grid = densities.reshape(self.height, self.width)  # Shape: (height, width)
-        binary_mask = (grid > 0.2).astype(np.uint8)
-        visited = np.zeros_like(binary_mask, dtype=bool)
-
-        def neighbors(r, c):
-            for nr, nc in [(r-1, c), (r+1, c), (r, c-1), (r, c+1)]:
-                if 0 <= nr < self.height and 0 <= nc < self.width:
-                    yield nr, nc
-
-        components = []
-        for r in range(self.height):
-            for c in range(self.width):
-                if binary_mask[r, c] == 1 and not visited[r, c]:
-                    queue = [(r, c)]
-                    visited[r, c] = True
-                    size = 0
-                    while queue:
-                        rr, cc = queue.pop()
-                        size += 1
-                        for rr2, cc2 in neighbors(rr, cc):
-                            if binary_mask[rr2, cc2] == 1 and not visited[rr2, cc2]:
-                                visited[rr2, cc2] = True
-                                queue.append((rr2, cc2))
-                    components.append(size)
-
-        if len(components) <= 1:
-            return 0.0  # No penalty
-        else:
-            largest = max(components)
-            others_sum = sum(components) - largest
-            penalty = 0.1 * others_sum  # Scale as needed
-            return penalty
-
-    def calculate_reward(self):
-        """
-        Calculate the reward based on compliance and constraints.
-        """
-        # Extract densities and forces from the state
-        densities_padded = self.state[0, :, :].cpu().numpy()  # Shape: (width+1, height+1)
-        normals_x = self.state[1, :, :].cpu().numpy()
-        normals_y = self.state[2, :, :].cpu().numpy()
-        forces_x = self.state[3, :, :].cpu().numpy()
-        forces_y = self.state[4, :, :].cpu().numpy()
-
-        # Flatten densities back to original grid size if necessary
-        # Assuming padding was added, remove it
-        densities = densities_padded[:self.width, :self.height]  # Shape: (width, height)
-        
-        # Flatten forces
-        forces = np.stack([forces_x, forces_y], axis=-1).reshape(-1, 2)  # Shape: (number_of_edges, 2)
-        
-        # Compute compliance and constraint
-        compliance, constraint = fem.optim(args=self.args, x=densities)
-        
-        self.current_compliance = compliance
-        self.current_constraint = constraint
-        
-        # Heavy penalty if compliance is excessively large
-        if compliance > 1e5:
-            return -10.0, {'raw_reward': -100.0, 'compliance': compliance, 'constraint': constraint}
-        
-        # Penalty for connectivity issues
-        penalty_connectivity = self.check_connectivity(densities)
-        
-        # Weighted components
-        r_compliance = -self.w_compliance * (compliance / self.base_compliance[self.beam_type])
-        
-        # Grey mask for densities between 0.2 and 0.8
-        grey_mask = (densities > 0.2) & (densities < 0.8)
-        fraction_grey = np.mean(grey_mask)  # Fraction of cells that are "grey"
-        
-        r_grey = -0.5 * fraction_grey  # Increased to push for binary (0/1) structures
-        
-        # Density low reward
-        density_low_reward = np.mean((0.5 - densities) ** 2)
-        r_density_low = self.w_density_low * density_low_reward
-        
-        # Mass penalty or deviation
-        total_mass = np.sum(densities)
-        target_total_density = self.optimal_density * self.width * self.height
-        mass_deviation = max(total_mass - target_total_density, 0)
-        r_mass = -self.w_total_mass * mass_deviation
-        
-        # Entropy
-        density_entropy = -np.mean(
-            densities * np.log(np.clip(densities, 1e-8, None)) +
-            (1 - densities) * np.log(np.clip(1 - densities, 1e-8, None))
+    def _solve_current(self):
+        compliance, energy = self.solver.solve(self._density, return_energy=True)
+        self.current_compliance = float(compliance)
+        self.current_contacts = count_corner_contacts(self._status)
+        self.current_objective = self._objective(
+            self.current_compliance, self.current_contacts, self._density
         )
-        r_entropy = self.w_entropy * density_entropy
-        
-        # Connectivity penalty
-        r_connectivity = -penalty_connectivity
-        
-        # Sum them
-        reward = (
-            r_compliance
-            + r_grey
-            + r_density_low
-            + r_mass
-            # + r_entropy
-            # + r_connectivity
-        )
-        
+        return energy
+
+    def _record_completed_design(self):
+        """Track the best finished, full-budget design. Returns True if new."""
+        if self._best_density is not None and self.current_objective >= self.best_objective:
+            return False
+        self.best_objective = self.current_objective
+        self.best_compliance = self.current_compliance
+        self.best_compliance_ratio = self.current_compliance / self.base_compliance_value
+        self.best_contacts = self.current_contacts
+        self._best_density = self._density.copy()
+        return True
+
+    def _info(self, **extra):
         info = {
-            'raw_reward': reward,
-            'compliance': compliance,
-            'constraint': constraint,
-            'r_compliance': r_compliance,
-            'r_density_low': r_density_low,
-            'r_mass': r_mass,
-            'r_entropy': r_entropy,
-            'r_connectivity': r_connectivity
+            "compliance": self.current_compliance,
+            "compliance_ratio": self.current_compliance / self.base_compliance_value,
+            "objective_cost": self.current_objective,
+            "contacts": self.current_contacts,
+            "volume_fraction": float(np.mean(self._density)),
+            "solid_cells": self._solid_count,
+            "undecided_cells": self._undecided_count,
+            "completed_refinement_swaps": self.completed_refinement_swaps,
+            "phase_id": self._phase_id,
+            "best_objective": self.best_objective,
+            "best_compliance_ratio": self.best_compliance_ratio,
+            "best_contacts": self.best_contacts,
+            "step": self.current_step,
         }
-        
-        return reward, info
+        info.update(extra)
+        return info
+
+    # ------------------------------------------------------------------
+    # Gymnasium API
+    # ------------------------------------------------------------------
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+        options = options or {}
+        if self.use_random_beam and options.get("regenerate_beam", True):
+            normals, forces = self._sample_problem()
+            self._set_problem(normals, forces)
+
+        self._status = np.zeros((self.height, self.width), dtype=np.int8)
+        self._density = np.full((self.height, self.width), self.target_density)
+        self._solid_count = 0
+        self._undecided_count = self.total_cells
+        self.current_step = 0
+        self.pending_removal_cell = None
+        self.completed_refinement_swaps = 0
+        self._swap_objective_before = None
+        self._terminated = False
+        self.reward = 0.0
+
+        # The uniform field was already solved when the problem was set.
+        self.current_compliance = self.base_compliance_value
+        self.current_contacts = 0
+        self.current_objective = self._objective(self.current_compliance, 0, self._density)
+        self.previous_objective = self.current_objective
+        self.initial_objective = self.current_objective
+        self.best_objective = float("inf")
+        self.best_compliance = float("inf")
+        self.best_compliance_ratio = float("inf")
+        self.best_contacts = 0
+        self._best_density = None
+
+        self._update_phase()
+        self._update_mask()
+        self._refresh_observation(self._base_energy)
+        return self._obs.copy(), self._info()
 
     def step(self, action):
-        """
-        Perform the action and return the new state, reward, done, truncated, and info.
-        """
-        # --- 1) Map action to cell index + direction ---
-        total_cells = self.width * self.height
-        if action < 0 or action >= 2 * total_cells:
-            raise ValueError(f"Invalid action: {action}")
-
-        cell = action % total_cells  # Which cell
-        direction = 'increase' if action >= total_cells else 'decrease'
-
-        # --- 2) Determine subgrid (phase) based on training progress ---
-        progress = self.current_step / self.max_steps
-        progress = np.clip(progress, 0.0, 1.0)
-
-        if progress < self.phase_threshold_1:
-            subgrid_size = 1
-        elif progress < self.phase_threshold_2:
-            subgrid_size = 1
-        else:
-            subgrid_size = 1
-
-        # --- 3) Step size decay ---
-        current_step_size = (
-            self.step_size_initial
-            - (self.step_size_initial - self.step_size_final) * progress
-        )
-        current_step_size = max(current_step_size, self.step_size_final)
-        self.step_size = current_step_size
-
-        # --- 4) Keep track of compliance BEFORE the action ---
-        compliance_before = self.previous_compliance
-
-        # --- 5) Apply the action (coarse or single-cell) ---
-        reward_action = 0.0
-        if subgrid_size >= 2:
-            # Modify subgrid
-            cells_to_modify = self.get_subgrid_cells(cell, size=subgrid_size)
-            weights = self.weight_matrices[subgrid_size]  # e.g., shape (5,5) or (3,3)
-
-            for idx, target_cell in enumerate(cells_to_modify):
-                r = idx // subgrid_size
-                c = idx % subgrid_size
-                w = weights[r, c].item()
-
-                # Positive or negative update
-                delta = self.step_size * w if direction == 'increase' else -self.step_size * w
-
-                old_density = self.state[0, target_cell // (self.height + 1), target_cell % (self.height + 1)].item()
-                new_density = np.clip(old_density + delta, 0.001, 1.0)
-
-                if new_density != old_density:
-                    # Small reward for successfully changing density
-                    self.state[0, target_cell // (self.height + 1), target_cell % (self.height + 1)] = new_density
-                    reward_action += 0.05 * w
-                else:
-                    # Penalty if we hit a boundary
-                    reward_action -= 0.05 * w
-        else:
-            # Single cell
-            row = cell // self.width
-            col = cell % self.width
-            padded_row = row
-            padded_col = col
-            old_density = self.state[0, padded_row, padded_col].item()
-            if direction == 'increase':
-                new_density = min(old_density + self.step_size, 1.0)
-            else:
-                new_density = max(old_density - self.step_size, 0.001)
-
-            if new_density != old_density:
-                self.state[0, padded_row, padded_col] = new_density
-                reward_action += 0.05
-            else:
-                reward_action -= 0.05
+        action = int(action)
+        if not self.action_space.contains(action):
+            raise ValueError(f"invalid action {action}; expected [0, {self.action_space.n})")
+        if self._terminated:
+            raise RuntimeError("step() called on a finished episode; call reset() first")
 
         self.current_step += 1
+        phase_before = self._phase_id
+        truncated = False
+        swap_completed = False
+        is_new_best = False
 
-        # --- 6) Compute domain-specific reward (compliance, mass, etc.) ---
-        main_reward, reward_info = self.calculate_reward() 
-        # This sets self.current_compliance internally, so now we have the AFTER compliance.
+        if not self._mask[action]:
+            # The policy masks these out. The penalty is a guard for callers
+            # that step the environment directly.
+            reward = -0.05
+            truncated = self.current_step >= 2 * self.max_steps + 2
+            self.reward = reward
+            return (
+                self._obs.copy(),
+                reward,
+                False,
+                truncated,
+                self._info(action_was_valid=False, swap_completed=False, is_new_best=False),
+            )
 
-        # --- 7) Intermediate compliance-improvement reward ---
-        compliance_after = self.current_compliance
-        self.previous_compliance = self.current_compliance
-        diff = 0
-        if compliance_before < 1e4:
-            diff = compliance_before - compliance_after
-            # If diff > 0 => compliance improved
-            # If diff < 0 => got worse
-            # Scale it so we don't overshadow main_reward
-            improvement_scale = 0.5  # Stronger signal for fine-tuning near optimum
-            reward_improvement = improvement_scale * diff / self.base_compliance[self.beam_type]
+        if action == self.stop_action:
+            self._terminated = True
+            self._update_phase()
+            self._update_mask()
+            self.reward = 0.0
+            return (
+                self._obs.copy(),
+                0.0,
+                True,
+                False,
+                self._info(action_was_valid=True, swap_completed=False, is_new_best=False),
+            )
+
+        cell = action % self.total_cells
+        row, col = divmod(cell, self.width)
+        make_solid = action >= self.total_cells
+        old_status = int(self._status[row, col])
+        new_status = SOLID if make_solid else VOID
+        self._status[row, col] = new_status
+        self._density[row, col] = self.maximum_density if make_solid else self.minimum_density
+        self._solid_count += int(new_status == SOLID) - int(old_status == SOLID)
+        self._undecided_count -= int(old_status == UNDECIDED)
+
+        if phase_before == 1:  # removal half of a swap
+            self.pending_removal_cell = cell
+            self._swap_objective_before = self.previous_objective
+        elif phase_before == 2:  # addition half of a swap
+            self.pending_removal_cell = None
+            self.completed_refinement_swaps += 1
+            swap_completed = True
+
+        energy = self._solve_current()
+
+        if phase_before == 1:
+            # A removal is only a proposal: the under-filled design is not
+            # scored, and the pair is paid when it is completed.
+            reward = 0.0
+        elif swap_completed:
+            reward = self._swap_objective_before - self.current_objective
+            self.previous_objective = self.current_objective
+            self._swap_objective_before = None
         else:
-            reward_improvement = 0.0
+            reward = self.previous_objective - self.current_objective
+            self.previous_objective = self.current_objective
 
-        # Combine everything
-        reward = reward_action + main_reward + reward_improvement
+        design_complete = self._undecided_count == 0 and self.pending_removal_cell is None
+        if design_complete:
+            is_new_best = self._record_completed_design()
+            if not self._swap_possible():
+                self._terminated = True
 
-        # Optionally, do mild scaling or clipping
-        reward = np.clip(reward, -10.0, 10.0)  # Linear clipping instead of squashing
+        self._update_phase()
+        self._update_mask()
+        self._refresh_observation(energy)
+        reward = float(np.clip(reward, -10.0, 10.0))
+        self.reward = reward
+        info = self._info(
+            action_was_valid=True, swap_completed=swap_completed, is_new_best=is_new_best
+        )
+        return self._obs.copy(), reward, self._terminated, truncated, info
 
-        if self.current_compliance < self.best_compliance[self.beam_type]:
-            self.best_compliance[self.beam_type] = self.current_compliance
-            reward += 0.1  # Small bonus for setting a new best
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+    def check_connectivity(self, densities=None):
+        """Fraction of solid cells outside the largest edge-connected component.
 
-        done = (self.current_step >= self.max_steps)
-
-        # Info dict
-        info = {
-            'compliance_before': compliance_before,
-            'compliance_after': compliance_after,
-            'compliance_diff': diff,
-            'reward_improvement': reward_improvement,
-            'reward_action': reward_action,
-            'reward_main': main_reward,
-            'compliance': self.current_compliance,
-            'constraint': self.current_constraint,
-            'subgrid_size': subgrid_size,
-            'direction': direction,
-            'step': self.current_step,
-        }
-
-        return self.state.cpu().numpy(), reward, done, False, info
-
-    def render(self, mode='human', step_interval=100):
+        A diagnostic only. Compliance already captures whether loads reach
+        supports, so this is not part of the reward.
         """
-        Render the current state of the environment.
-        """
-        if mode == 'human':
-            densities_padded = self.state[0, :, :].cpu().numpy()
-            grid = densities_padded[:self.width, :self.height].reshape(self.width, self.height)
-            plt.figure(figsize=(6,6))
-            plt.imshow(grid, cmap='viridis', interpolation='nearest', vmin=0, vmax=1)
-            plt.colorbar()
-            plt.title(f"Step: {self.current_step} | Reward: {self.reward:.3f} | Compliance: {self.current_compliance:.3f}")
-            plt.xlabel("Width")
-            plt.ylabel("Height")
-            plt.show()
+        grid = self._density if densities is None else np.asarray(densities)
+        solid = grid.reshape(self.height, self.width) > 0.2
+        visited = np.zeros_like(solid, dtype=bool)
+        components = []
+        for row in range(self.height):
+            for col in range(self.width):
+                if not solid[row, col] or visited[row, col]:
+                    continue
+                stack = [(row, col)]
+                visited[row, col] = True
+                size = 0
+                while stack:
+                    current_row, current_col = stack.pop()
+                    size += 1
+                    for next_row, next_col in (
+                        (current_row - 1, current_col),
+                        (current_row + 1, current_col),
+                        (current_row, current_col - 1),
+                        (current_row, current_col + 1),
+                    ):
+                        if (
+                            0 <= next_row < self.height
+                            and 0 <= next_col < self.width
+                            and solid[next_row, next_col]
+                            and not visited[next_row, next_col]
+                        ):
+                            visited[next_row, next_col] = True
+                            stack.append((next_row, next_col))
+                components.append(size)
+        if len(components) <= 1:
+            return 0.0
+        return float((sum(components) - max(components)) / max(sum(components), 1))
+
+    def render(self, best=False):
+        """Draw the current design, or the best completed one with ``best=True``."""
+        import matplotlib.pyplot as plt
+
+        if best and self._best_density is not None:
+            grid = self._best_density
+            compliance, contacts, label = self.best_compliance, self.best_contacts, "best"
         else:
-            pass  # No rendering for other modes or steps
+            grid = self._density
+            compliance, contacts, label = self.current_compliance, self.current_contacts, "current"
+        plt.figure(figsize=(6, 6))
+        image = plt.imshow(grid, cmap="viridis", interpolation="nearest", vmin=0, vmax=1)
+        colorbar = plt.colorbar(image)
+        colorbar.set_label("Density (0 = void, 1 = solid)")
+        support_x, support_y = np.where(self.normals.any(axis=2))
+        plt.scatter(support_x - 0.5, support_y - 0.5, marker="s", s=40, c="cyan", label="support")
+        load_x, load_y = np.where(np.linalg.norm(self.forces, axis=2) > 1e-12)
+        if len(load_x):
+            # Arrows show direction only, drawn about one cell long.
+            vectors = self.forces[load_x, load_y]
+            vectors = vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
+            plt.quiver(
+                load_x - 0.5,
+                load_y - 0.5,
+                vectors[:, 0],
+                vectors[:, 1],
+                color="red",
+                angles="xy",
+                scale_units="xy",
+                scale=1.0,
+            )
+        plt.title(
+            f"{label} | step {self.current_step} | "
+            f"C/C0 {compliance / self.base_compliance_value:.3f} | "
+            f"corner contacts {contacts} | "
+            f"volume {float(np.mean(grid)):.3f}/{self.target_density:.3f}"
+        )
+        plt.xlabel("X / width")
+        plt.ylabel("Y / height")
+        plt.show()
 
     def close(self):
-        """
-        Clean up the environment's resources.
-        """
-        plt.close()
+        try:
+            import matplotlib.pyplot as plt
 
-    def compute_weight_matrix(self, size):
-        """
-        Compute a weight matrix for a given subgrid size where central cells have higher weights.
-        
-        Args:
-            size (int): Size of the subgrid (e.g., 5 for 5x5).
-        
-        Returns:
-            torch.Tensor: Weight matrix of shape (size, size).
-        """
-        center = size // 2
-        weights = np.zeros((size, size), dtype=np.float32)
-        for r in range(size):
-            for c in range(size):
-                distance = max(abs(r - center), abs(c - center))
-                if distance == 0:
-                    weight = 1.0
-                elif distance == 1:
-                    weight = 0.8
-                elif distance == 2:
-                    weight = 0.6
-                elif distance == 3:
-                    weight = 0.4
-                elif distance == 4:
-                    weight = 0.2
-                else:
-                    weight = 0.0  # Beyond the subgrid
-                weights[r, c] = weight
-        weights /= weights.max()
-        return torch.tensor(weights, dtype=torch.float32, device=self.device)
-
-    def get_subgrid_cells(self, cell, size):
-        """
-        Retrieves cells within a subgrid centered around a specific cell.
-        
-        Args:
-            cell (int): Central cell index.
-            size (int): Size of the subgrid.
-        
-        Returns:
-            list: List of cell indices within the subgrid.
-        """
-        subgrid_cells = []
-        half_size = size // 2
-        row = cell // self.width
-        col = cell % self.width
-
-        for dr in range(-half_size, half_size + 1):
-            for dc in range(-half_size, half_size + 1):
-                new_row = row + dr
-                new_col = col + dc
-                if 0 <= new_row < self.width + 1 and 0 <= new_col < self.height + 1:
-                    neighbor = new_row * (self.height + 1) + new_col
-                    subgrid_cells.append(neighbor)
-
-        return subgrid_cells
+            plt.close("all")
+        except Exception:
+            pass

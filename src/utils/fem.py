@@ -132,10 +132,10 @@ def mbb_beam_8(width=6, height=6, density=0.4, y=1, x=0):
 
 def mbb_beam_9(width=6, height=6, density=0.4, y=1, x=0):  # textbook beam example
     normals = np.zeros((width + 1, height + 1, 2))
-    normals[-1, -width//2, y] = 1
+    normals[-1, -(height//2), y] = 1
     normals[0, :, x] = 1
     forces = np.zeros((width + 1, height + 1, 2))
-    forces[0, width, y] = -1
+    forces[0, height, y] = -1
     return normals, forces, density
 #'''
 def _get_solver(a_entries, a_indices, size, sym_pos):
@@ -179,22 +179,27 @@ def mean_density(x, args, volume_contraint=False, use_filter=False):
 def objective_calc(x, args, volume_contraint=False, use_filter=False):
   kwargs = dict(penal=args.penal, e_min=args.young_min, e_0=args.young)
   x_phys = physical_density(x, args, volume_contraint=volume_contraint, use_filter=use_filter)
-  ke     = get_stiffness_matrix(args.young, args.poisson)  # stiffness matrix
-  u      = displace(x_phys, ke, args.forces, args.freedofs, args.fixdofs, **kwargs)
-  c      = compliance_calc(x_phys, u, ke, **kwargs)
+  # Element topology, boundary-condition maps, and the element stiffness
+  # matrix are constant for the lifetime of a beam problem. Building them on
+  # every RL action was pure overhead, especially on larger grids.
+  cache = getattr(args, '_fem_cache', None)
+  if cache is None:
+    cache = _build_fem_cache(args)
+    args._fem_cache = cache
+  ke     = cache['ke']
+  u      = displace(x_phys, ke, args.forces, args.freedofs, args.fixdofs,
+                    fem_cache=cache, **kwargs)
+  c      = compliance_calc(x_phys, u, ke,
+                           element_dofs=cache['element_dofs'], **kwargs)
   #print("x_phys= ",  x_phys)
   #print("compliance = ", c)
   return c
-def compliance_calc(x_phys, u, ke, *, penal=3, e_min=1e-9, e_0=1):
+def compliance_calc(x_phys, u, ke, *, penal=3, e_min=1e-9, e_0=1,
+                    element_dofs=None):
   nely, nelx = x_phys.shape
-  ely, elx = anp.meshgrid(range(nely), range(nelx))  # x, y coords for the index map
-
-  n1 = (nely+1)*(elx+0) + (ely+0)  # nodes
-  n2 = (nely+1)*(elx+1) + (ely+0)
-  n3 = (nely+1)*(elx+1) + (ely+1)
-  n4 = (nely+1)*(elx+0) + (ely+1)
-  all_ixs = anp.array([2*n1, 2*n1+1, 2*n2, 2*n2+1, 2*n3, 2*n3+1, 2*n4, 2*n4+1])
-  u_selected = u[all_ixs]  # select from u matrix
+  if element_dofs is None:
+    element_dofs = _get_element_dofs(nely, nelx)
+  u_selected = u[element_dofs]  # select from u matrix
 
   ke_u = anp.einsum('ij,jkl->ikl', ke, u_selected)  # compute x^penal * U.T @ ke @ U
   ce = anp.einsum('ijk,ijk->jk', u_selected, ke_u)
@@ -233,12 +238,21 @@ def get_k(stiffness, ke):
   value_list = (kd * anp.tile(ke, kd.shape)).flatten()
   return value_list, y_list, x_list
 
-def displace(x_phys, ke, forces, freedofs, fixdofs, *, penal=3, e_min=1e-9, e_0=1):
+def displace(x_phys, ke, forces, freedofs, fixdofs, *, penal=3, e_min=1e-9,
+             e_0=1, fem_cache=None):
   # Displaces the load x using finite element techniques (solve_coo=most of runtime)
   stiffness = young_modulus(x_phys, e_0, e_min, p=penal)
-  k_entries, k_ylist, k_xlist = get_k(stiffness, ke)
-
-  index_map, keep, indices = _get_dof_indices(freedofs, fixdofs, k_ylist, k_xlist)
+  if fem_cache is None:
+    k_entries, k_ylist, k_xlist = get_k(stiffness, ke)
+    index_map, keep, indices = _get_dof_indices(
+        freedofs, fixdofs, k_ylist, k_xlist)
+  else:
+    nely, nelx = stiffness.shape
+    kd = stiffness.T.reshape(nelx*nely, 1, 1)
+    k_entries = (kd * ke).flatten()
+    index_map = fem_cache['index_map']
+    keep = fem_cache['keep']
+    indices = fem_cache['indices']
   
   u_nonzero = solve_coo(k_entries[keep], indices, forces[freedofs], sym_pos=True)
   u_values = anp.concatenate([u_nonzero, anp.zeros(len(fixdofs))])
@@ -250,6 +264,32 @@ def _get_dof_indices(freedofs, fixdofs, k_xlist, k_ylist):
   i = index_map[k_ylist][keep]
   j = index_map[k_xlist][keep]
   return index_map, keep, anp.stack([i, j])
+
+def _get_element_dofs(nely, nelx):
+  """Return the constant eight-DOF map for every finite element."""
+  ely, elx = anp.meshgrid(range(nely), range(nelx))
+  n1 = (nely+1)*(elx+0) + (ely+0)
+  n2 = (nely+1)*(elx+1) + (ely+0)
+  n3 = (nely+1)*(elx+1) + (ely+1)
+  n4 = (nely+1)*(elx+0) + (ely+1)
+  return anp.array([
+      2*n1, 2*n1+1, 2*n2, 2*n2+1,
+      2*n3, 2*n3+1, 2*n4, 2*n4+1])
+
+def _build_fem_cache(args):
+  """Precompute all problem data that does not depend on density."""
+  ke = get_stiffness_matrix(args.young, args.poisson)
+  unit_stiffness = anp.ones((args.nely, args.nelx))
+  _, k_ylist, k_xlist = get_k(unit_stiffness, ke)
+  index_map, keep, indices = _get_dof_indices(
+      args.freedofs, args.fixdofs, k_ylist, k_xlist)
+  return {
+      'ke': ke,
+      'index_map': index_map,
+      'keep': keep,
+      'indices': indices,
+      'element_dofs': _get_element_dofs(args.nely, args.nelx),
+  }
 
 def inverse_permutation(indices):  # reverses an index operation
   inverse_perm = np.zeros(len(indices), dtype=anp.int64)
